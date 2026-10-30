@@ -54,7 +54,9 @@ export async function verifySourceContract(assetDirectory = path.join(root, prof
     assert.ok(/\b_e\(e,1\)/.test(login), 'Domestic player query must pass is_domestic=1');
     assert.ok(/\bse\([^;]+,"sdk",i,a,1\)/.test(login), 'Domestic SDK login must pass source=sdk and is_domestic=1');
     assert.ok(loginView.includes('handleInlandSDKLogin'), 'Login view must bind the domestic SDK callback');
-    assert.ok(loginView.includes('Re({link:'), 'Login view must load the embedded SDK assets');
+    // The minified loader callee is renamed between upstream builds (Re in 1.0.1, Oe in 1.0.2),
+    // so assert the loader shape (stylesheet link + script onload) instead of the identifier.
+    assert.ok(/\{link:\[\{rel:"stylesheet"/.test(loginView) && loginView.includes('onload:'), 'Login view must load the embedded SDK assets');
     const scriptIsHttps = main.includes(`isdkSrc="${contract.auth.sdk.scriptUrl}"`);
     const stylesheetIsHttps = main.includes(`isdkCss="${contract.auth.sdk.stylesheetUrl}"`);
     assert.ok(scriptIsHttps || main.includes(`isdkSrc="${contract.auth.sdk.sourceScriptUrl}"`), 'Unexpected domestic SDK script URL');

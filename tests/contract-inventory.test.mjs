@@ -12,7 +12,9 @@ test('selected region runtime and Windows installer have separate exhaustive inv
   assert.equal(runtimeCommands.length, 50);
   assert.equal(contract.commands.filter(item => item.kind === 'application' && item.scopes.includes('windows-installer')).length, profile.id === 'cn' ? 9 : 11);
   assert.equal(contract.commands.filter(item => item.kind === 'plugin').length, profile.id === 'cn' ? 119 : 120);
-  assert.equal(contract.events.length, profile.id === 'cn' ? 59 : 60);
+  // Named-event surface per pinned upstream: cn 1.0.2 exposes 60 (1.0.1 had 59), global is still pinned to 1.0.1 with 60.
+  const expectedEvents = { cn: 60, global: 60 };
+  assert.equal(contract.events.length, expectedEvents[profile.id]);
   assert.equal(contract.sourceApplication.region, profile.region);
   assert.equal(contract.sourceApplication.version, JSON.parse(fs.readFileSync(path.join(root, profile.upstreamLock), 'utf8')).version);
   assert.equal(Object.hasOwn(contract.runtimeConstants, 'authCallbackScheme'), profile.id === 'global');
