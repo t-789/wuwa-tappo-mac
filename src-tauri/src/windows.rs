@@ -71,6 +71,7 @@ pub struct WindowState {
     auxiliary: RwLock<BTreeMap<String, HitRegion>>,
     main_geometry: RwLock<MainGeometry>,
     stop: AtomicBool,
+    dock_icon_hidden: AtomicBool,
 }
 
 #[derive(Default)]
@@ -110,6 +111,68 @@ fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
         .ok_or_else(|| "Main window is unavailable".into())
 }
 
+/// The reference overlay is a UI-element process (the `LSUIElement` equivalent).
+/// A foreground process loses its windows from another app's full-screen Space
+/// no matter how they are configured, so the policy has to match the overlay
+/// preference — and it has to be settled before the windows are created.
+/// Switching the menu item off restores the Dock tile.
+pub fn sync_activation_policy(app: &AppHandle) -> Result<(), String> {
+    use objc2_app_kit::NSApplication;
+    const ACCESSORY: isize = 1;
+    const REGULAR: isize = 0;
+    let mtm = objc2::MainThreadMarker::new()
+        .ok_or("Activation policy must be changed on the main thread")?;
+    let hidden = app
+        .try_state::<WindowState>()
+        .is_some_and(|state| state.dock_icon_hidden.load(Ordering::Acquire));
+    let accessory = crate::overlay::enabled(app) || hidden;
+    let policy = if accessory { ACCESSORY } else { REGULAR };
+    let application = NSApplication::sharedApplication(mtm);
+    // SAFETY: AppKit runs on the main thread (checked above) and the selector
+    // takes the raw `NSApplicationActivationPolicy` value.
+    let applied: bool = unsafe { objc2::msg_send![&*application, setActivationPolicy: policy] };
+    if applied {
+        return Ok(());
+    }
+    // AppKit refuses the accessory → regular direction from
+    // `setActivationPolicy:`; the process-type transform is the documented way
+    // back, and tauri already wraps it for the Dock-tile preference.
+    app.set_dock_visibility(!accessory).map_err(err)
+}
+
+/// An `always_on_top` window still sits behind another app's fullscreen Space.
+/// `CanJoinAllSpaces` plus `FullScreenAuxiliary` lets the pet join that Space at
+/// `NSFloatingWindowLevel`, which is what the reference overlay does.
+///
+/// The level is written here instead of through `set_always_on_top`: tauri (tao)
+/// casts a raw `CGWindowLevelKey` into the window level and applies it through
+/// the main queue, so that write neither matches `NSFloatingWindowLevel` nor
+/// survives an overlay change.
+pub fn apply_float_over_fullscreen(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    use objc2_app_kit::{NSFloatingWindowLevel, NSWindow, NSWindowCollectionBehavior};
+    let _main_thread = objc2::MainThreadMarker::new()
+        .ok_or("Window level must be changed on the main thread")?;
+    let handle = main_window(app)?.ns_window().map_err(err)?;
+    if handle.is_null() {
+        return Err("Main window has no native window".into());
+    }
+    let mut behavior =
+        NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::Stationary;
+    if enabled {
+        behavior |= NSWindowCollectionBehavior::FullScreenAuxiliary;
+        behavior |= NSWindowCollectionBehavior::IgnoresCycle;
+    }
+    // SAFETY: AppKit window objects are only touched on the main thread (checked
+    // above), and the pointer belongs to the window tauri keeps alive for us.
+    unsafe {
+        let window: &NSWindow = &*handle.cast::<NSWindow>();
+        window.setCollectionBehavior(behavior);
+        window.setLevel(NSFloatingWindowLevel);
+        window.orderFrontRegardless();
+    }
+    sync_activation_policy(app)
+}
+
 fn initialize(app: &AppHandle, label: &str) -> Result<String, String> {
     let script = app.state::<SessionStore>().initialization_script()?;
     let mut initialization = format!(
@@ -121,6 +184,10 @@ fn initialize(app: &AppHandle, label: &str) -> Result<String, String> {
     if label == "main" && cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--self-test")
     {
         initialization.push_str(include_str!("../../scripts/runtime-smoke.js"));
+    }
+    let requested_paint_mode = std::env::var("WUWA_COUNTDOWN_PAINT").ok();
+    if let Some(mode) = crate::profile::countdown_paint_override(requested_paint_mode.as_deref()) {
+        initialization.push_str(&crate::profile::countdown_paint_initialization_script(mode));
     }
     Ok(initialization)
 }
@@ -600,7 +667,11 @@ pub fn dispatch(
                 .get("alwaysOnTop")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            main_window(app)?.set_always_on_top(top).map_err(err)?;
+            // `apply_float_over_fullscreen` owns the pet level: tauri maps
+            // `always_on_top` to a raw `CGWindowLevelKey` value and applies it
+            // through the main queue, so that write would both drift away from
+            // `NSFloatingWindowLevel` and lower the fullscreen overlay level.
+            apply_float_over_fullscreen(app, top && crate::overlay::enabled(app))?;
             // In the original fullscreen shell the Vue dock, not the OS window,
             // applies the selected corner; moving this window would move it twice.
             fullscreen_shell(app)?;
@@ -633,12 +704,14 @@ pub fn dispatch(
             main_window(app)?.set_cursor_icon(cursor).map_err(err)?;
         }
         "ensure_main_taskbar_icon" => {
-            app.set_dock_visibility(true).map_err(err)?;
+            state.dock_icon_hidden.store(false, Ordering::Release);
+            sync_activation_policy(app)?;
             main_window(app)?.set_skip_taskbar(false).map_err(err)?;
         }
         "set_main_skip_taskbar" => {
             let skip = args.get("skip").and_then(Value::as_bool).ok_or("Missing skip state")?;
-            app.set_dock_visibility(!skip).map_err(err)?;
+            state.dock_icon_hidden.store(skip, Ordering::Release);
+            sync_activation_policy(app)?;
             main_window(app)?.set_skip_taskbar(skip).map_err(err)?;
         }
         "show_toast_overlay" => {
@@ -675,6 +748,9 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     refresh_geometry(app, "main")?;
     w.set_ignore_cursor_events(true).map_err(err)?;
     w.show().map_err(err)?;
+    if let Err(error) = apply_float_over_fullscreen(app, crate::overlay::enabled(app)) {
+        eprintln!("Could not apply the saved overlay level: {error}");
+    }
     if cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--inspect") {
         w.open_devtools();
     }

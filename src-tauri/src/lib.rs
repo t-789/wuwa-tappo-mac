@@ -2,6 +2,7 @@ mod auth;
 mod geometry;
 mod input;
 mod menu;
+mod overlay;
 mod profile;
 mod session;
 mod socket;
@@ -272,6 +273,15 @@ pub fn run() {
             app.manage(storage::CounterStore::new(
                 app.path().app_data_dir()?.join("counters.json"),
             ));
+            app.manage(overlay::OverlayState::new(
+                app.path().app_config_dir()?.join(overlay::FILE_NAME),
+            ));
+            // The activation policy has to settle before the windows and the tray
+            // exist, otherwise the overlay window keeps the foreground process's
+            // Space membership and the tray is built as a Dock app.
+            if let Err(error) = windows::sync_activation_policy(&handle) {
+                eprintln!("Could not apply the activation policy: {error}");
+            }
             menu::setup(&handle)?;
             app.manage(system::start_network_monitor(handle.clone())?);
             tauri::WebviewWindowBuilder::new(

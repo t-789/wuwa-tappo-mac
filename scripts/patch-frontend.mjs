@@ -85,6 +85,39 @@ export function patchMacAbout(source, region = 'CN') {
     .replace(remote, `t=${computed}(()=>{const html=k("about_content")?String(v("about_content")).trim():"";return html?${JSON.stringify(banner)}+html.replace("系统配置","Windows 原版系统配置").replace("系統配備","Windows 原版系統配備"):""})`);
 }
 
+export function patchMacCountdownPaintPolicy(source) {
+  if (source.includes('wuwa.countdownPaint')) throw new Error('Countdown paint switch is already applied; reconcile the patch order before building.');
+  if (!source.includes('const APP_REGION="')) throw new Error('Original frontend entry module not found; reconcile the countdown paint switch before building.');
+  if (source.split('export{').length !== 2 || !/(?<![\w$])export\{[^{}]*\};?\s*$/.test(source)) {
+    throw new Error('Original entry module export tail changed; reconcile the countdown paint switch before building.');
+  }
+  const policy = `;(()=>{/* wuwa.countdownPaint diagnostic switch: countdown paint A/B for the GPU-process leak hunt; the WUWA_COUNTDOWN_PAINT launch env wins over the storage key; delete this block to restore stock rendering. */
+try{const KEY="wuwa.countdownPaint",MODES={default:null,"no-shadow":{css:".reward-countdown__progress{filter:none!important}"},"no-svgfilter":{sel:"mask image[filter]",attr:"filter"},"no-mask":{sel:"path.reward-countdown__bar[mask]",attr:"mask"},"no-transition":{css:".reward-countdown__bar{transition:none!important}"},hidden:{css:".reward-countdown{display:none!important}"}},mode=window.__WUWATAPPO_COUNTDOWN_PAINT__??localStorage.getItem(KEY);
+if(!mode||mode==="default"||!Object.prototype.hasOwnProperty.call(MODES,mode))return;
+const root=document.documentElement,spec=MODES[mode];
+if(spec.css){const style=document.createElement("style");style.setAttribute("data-wuwa-countdown-paint",mode);style.textContent=spec.css;(document.head??root).appendChild(style);return}
+const strip=node=>{if(!node||node.nodeType!==1)return;if(node.matches(spec.sel))node.removeAttribute(spec.attr);for(const hit of node.querySelectorAll(spec.sel))hit.removeAttribute(spec.attr)};strip(root),new MutationObserver(list=>{for(const record of list){if(record.type==="attributes")strip(record.target);else for(const node of record.addedNodes)strip(node)}}).observe(root,{childList:!0,subtree:!0,attributes:!0,attributeFilter:["filter","mask"]})}catch{}})();`;
+  return `${source}\n${policy}\n`;
+}
+
+export const COUNTDOWN_PAINT_COST_MARK = 'WUWA_MAC_COUNTDOWN_PAINT_COST';
+
+export function patchMacCountdownPaintCost(css) {
+  if (css.includes(COUNTDOWN_PAINT_COST_MARK)) throw new Error('Mac countdown paint cost override is already applied; reconcile the patch order before building.');
+  const stock = [
+    ['countdown bar stroke-dasharray transition', /\.reward-countdown \.reward-countdown__bar\{[^}]*transition:stroke-dasharray[^}]*\}/g],
+    ['countdown progress drop-shadow filter', /\.reward-countdown \.reward-countdown__progress\{[^}]*filter:drop-shadow\([^}]*\}/g],
+  ];
+  for (const [description, pattern] of stock) {
+    const found = [...css.matchAll(pattern)].length;
+    if (found !== 1) throw new Error(`Original ${description} changed; found ${found} stock rules, reconcile the Mac countdown paint cost override before building.`);
+  }
+  const override = `/* ${COUNTDOWN_PAINT_COST_MARK}: the countdown ring repaints every second at full window scale, and both the drop-shadow filters and the stroke-dasharray tween force WebKit to re-rasterize that layer instead of reusing its tile; neither override changes the ring geometry, the SVG mask is untouched. */
+.reward-countdown .reward-countdown__progress{filter:none!important}
+.reward-countdown .reward-countdown__bar{transition:none!important}`;
+  return `${css}\n${override}\n`;
+}
+
 export function patchGlobalAuthListener(source) {
   const bridge = 'async function onOpenUrl(e){return await listen("deep-link://new-url",t=>{e(t.payload)})}';
   const wake = 'async function onOpenUrl(e){return await listen("mac-oauth-callback-ready",()=>{getCurrent().then(t=>{if(t?.length)return e(t)}).catch(()=>console.warn("[macOS] OAuth callback could not be read"))})}';

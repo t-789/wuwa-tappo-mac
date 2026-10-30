@@ -59,6 +59,7 @@ struct MenuOptions {
     pet_scale: u32,
     window_opacity: u32,
     window_passthrough: bool,
+    float_over_fullscreen: bool,
 }
 
 impl Default for MenuOptions {
@@ -69,6 +70,7 @@ impl Default for MenuOptions {
             pet_scale: 100,
             window_opacity: 100,
             window_passthrough: false,
+            float_over_fullscreen: false,
         }
     }
 }
@@ -89,6 +91,7 @@ impl MenuOptions {
 struct MenuState {
     context: Mutex<Menu<tauri::Wry>>,
     tray: TrayIcon,
+    options: Mutex<MenuOptions>,
 }
 
 fn normal(app: &AppHandle, id: &str, title: &str) -> tauri::Result<MenuItemKind<tauri::Wry>> {
@@ -185,6 +188,12 @@ fn context_items(
             "window-opacity",
             &OPACITY_PRESETS,
             options.window_opacity,
+        )?,
+        checked(
+            app,
+            "toggle-float-over-fullscreen",
+            "在全屏应用上显示",
+            options.float_over_fullscreen,
         )?,
         checked(
             app,
@@ -317,8 +326,56 @@ fn event_for_id(id: &str) -> Option<(&'static str, Value)> {
     Some(event)
 }
 
+/// The frontend cannot see this preference, so every menu rebuild takes the
+/// checkmark from the Rust-owned state instead of the incoming options.
+fn with_overlay(app: &AppHandle, mut options: MenuOptions) -> MenuOptions {
+    options.float_over_fullscreen = crate::overlay::enabled(app);
+    options
+}
+
+fn rebuild(app: &AppHandle, options: MenuOptions) -> Result<(), String> {
+    let state = app
+        .try_state::<MenuState>()
+        .ok_or("native menu not initialized")?;
+    let options = with_overlay(app, options);
+    let tray_menu = context_menu(app, &options, true).map_err(|e| e.to_string())?;
+    let context = context_menu(app, &options, false).map_err(|e| e.to_string())?;
+    state
+        .tray
+        .set_menu(Some(tray_menu))
+        .map_err(|e| e.to_string())?;
+    app.set_menu(application_menu(app, &options).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    *state
+        .context
+        .lock()
+        .map_err(|_| "native menu state poisoned")? = context;
+    *state
+        .options
+        .lock()
+        .map_err(|_| "native menu state poisoned")? = options;
+    Ok(())
+}
+
+fn toggle_float_over_fullscreen(app: &AppHandle) -> Result<(), String> {
+    let overlay = app
+        .try_state::<crate::overlay::OverlayState>()
+        .ok_or("overlay state not initialized")?;
+    let enabled = !overlay.enabled();
+    overlay.set_enabled(enabled)?;
+    let applied = crate::windows::apply_float_over_fullscreen(app, enabled);
+    let stored = app
+        .try_state::<MenuState>()
+        .ok_or("native menu not initialized")?
+        .options
+        .lock()
+        .map_err(|_| "native menu state poisoned")?
+        .clone();
+    applied.and(rebuild(app, stored))
+}
+
 pub fn setup(app: &AppHandle) -> Result<(), String> {
-    let options = MenuOptions::default();
+    let options = with_overlay(app, MenuOptions::default());
     let tray_menu = context_menu(app, &options, true).map_err(|e| e.to_string())?;
     let context = context_menu(app, &options, false).map_err(|e| e.to_string())?;
     let icon = app.default_window_icon().cloned().ok_or("Application icon is unavailable")?;
@@ -334,11 +391,18 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     if !app.manage(MenuState {
         context: Mutex::new(context),
         tray,
+        options: Mutex::new(options),
     }) {
         return Err("native menu already initialized".into());
     }
     app.on_menu_event(|app, event| {
         let id = event.id().as_ref();
+        if id == "toggle-float-over-fullscreen" {
+            if let Err(error) = toggle_float_over_fullscreen(app) {
+                eprintln!("native menu action failed: {error}");
+            }
+            return;
+        }
         if app.get_webview_window("main").is_none() {
             match id {
                 "quit" => {
@@ -364,7 +428,7 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn sync(app: &AppHandle, args: &Value) -> Result<Value, String> {
-    let options = MenuOptions::from_args(args)?;
+    let options = with_overlay(app, MenuOptions::from_args(args)?);
     let tray_menu = context_menu(app, &options, true).map_err(|e| e.to_string())?;
     let context = context_menu(app, &options, false).map_err(|e| e.to_string())?;
     let state = app
@@ -384,6 +448,10 @@ pub fn sync(app: &AppHandle, args: &Value) -> Result<Value, String> {
         .context
         .lock()
         .map_err(|_| "native menu state poisoned")? = context;
+    *state
+        .options
+        .lock()
+        .map_err(|_| "native menu state poisoned")? = options;
     Ok(Value::Null)
 }
 
@@ -442,6 +510,15 @@ mod tests {
         assert!(event_for_id("pet-scale-201").is_none());
         assert!(event_for_id("window-opacity-101").is_none());
         assert!(event_for_id("pet-scale-nan").is_none());
+    }
+
+    #[test]
+    fn overlay_toggle_is_native_only_and_defaults_off() {
+        assert!(event_for_id("toggle-float-over-fullscreen").is_none());
+        assert!(!MenuOptions::default().float_over_fullscreen);
+        assert!(!MenuOptions::from_args(&json!({}))
+            .unwrap()
+            .float_over_fullscreen);
     }
 
     #[test]
