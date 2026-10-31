@@ -7,7 +7,9 @@ export function patchSessionBarriers(source) {
       return `async function ${name}(e,t={},n){if(e==="open_login_window"||e==="open_panel_window"||e==="plugin:event|emit"&&(t.event==="cat-auth-login-success"||t.event==="cat-auth-logout"))await window.__WUWATAPPO_SESSION__?.flush();return window.__TAURI_INTERNALS__.invoke(e,t,n)}`;
     },
   );
-  if (changes !== 2) throw new Error(`Expected 2 original Tauri invoke wrappers, found ${changes}. Reconcile the app version before building.`);
+  // 1.0.3 keeps one invoke wrapper in the entry module; the plugin-dialog copy moved to its own
+  // chunk (assets/index-BtAv0o2S.js) and never issues a barrier command, so one wrapper is complete.
+  if (changes !== 1) throw new Error(`Expected 1 original Tauri invoke wrapper, found ${changes}. Reconcile the app version before building.`);
   return patched;
 }
 
@@ -52,10 +54,11 @@ export function patchDomesticLoginReload(source) {
 }
 
 export function patchMacUpdateFeedback(source) {
-  const pattern = /if\(([$\w]+)\.kind==="error"\)\{([^{}]*?)([$\w]+)\.value=n\("setting_version_check_failed"\);return\}/g;
+  // The i18n alias is minified per build (1.0.2 "n", 1.0.3 "t"), so match and re-emit whichever one the bundle carries.
+  const pattern = /if\(([$\w]+)\.kind==="error"\)\{([^{}]*?)([$\w]+)\.value=([$\w]+)\("setting_version_check_failed"\);return\}/g;
   const matches = [...source.matchAll(pattern)];
   if (matches.length !== 1) throw new Error('Original update feedback changed; reconcile the Mac update message before building.');
-  return source.replace(pattern, (_, error, before, target) => `if(${error}.kind==="error"){${before}${target}.value=${error}.message||n("setting_version_check_failed");return}`);
+  return source.replace(pattern, (_, error, before, target, i18n) => `if(${error}.kind==="error"){${before}${target}.value=${error}.message||${i18n}("setting_version_check_failed");return}`);
 }
 
 export function patchMacUpdater(source) {
@@ -67,6 +70,19 @@ export function patchMacUpdater(source) {
     if (source.split(original).length !== 2) throw new Error('Original updater flow changed; reconcile the Mac update path before building.');
   }
   return source.replace(resolver, recovery).replace(failure, report);
+}
+
+export const MAC_NATIVE_HTTP_MARK = 'WUWA_MAC_NATIVE_HTTP_ADAPTER';
+
+export const NATIVE_HTTP_CLIENT = 'const jsonpClient=new Request({timeout:10*1e3,baseURL:HOST});';
+
+export const NATIVE_HTTP_CLIENT_PATCHED = `const jsonpClient=new Request({timeout:10*1e3,baseURL:HOST,...(window.__WUWATAPPO_HTTP_ADAPTER__?{adapter:window.__WUWATAPPO_HTTP_ADAPTER__}:{})});/* ${MAC_NATIVE_HTTP_MARK}: the upstream Request class only builds its AbortController and takes its one-way URL lock when no adapter is configured, so a configured adapter drops both, and the transport stops going through the WKWebView preflight path that can hang forever (.work/http-hang-diagnosis.md). The spread contributes nothing when scripts/mac-http.js did not run, which leaves the stock webview client byte for byte in place. */`;
+
+export function patchMacNativeHttpAdapter(source) {
+  if (source.includes(MAC_NATIVE_HTTP_MARK)) throw new Error('Mac native HTTP adapter is already wired; reconcile the patch order before building.');
+  const found = source.split(NATIVE_HTTP_CLIENT).length - 1;
+  if (found !== 1) throw new Error(`Expected 1 original jsonp client, found ${found}. Reconcile the app version before building.`);
+  return source.replace(NATIVE_HTTP_CLIENT, () => NATIVE_HTTP_CLIENT_PATCHED);
 }
 
 export function patchMacAbout(source, region = 'CN') {
@@ -116,6 +132,21 @@ export function patchMacCountdownPaintCost(css) {
 .reward-countdown .reward-countdown__progress{filter:none!important}
 .reward-countdown .reward-countdown__bar{transition:none!important}`;
   return `${css}\n${override}\n`;
+}
+
+const SHORTCUT_CAPTURE_ACTIONS = ['togglePet', 'gameMode', 'switchScreen'];
+const SHORTCUT_CAPTURE_CALL = /[$\w]+\([$\w]+,\{action:"(togglePet|gameMode|switchScreen)",binding:[$\w$.]+\.\1,disabled:![$\w]+\.value,label:[$\w]+\([$\w]+\)\("setting_[a-z_]+"\),onChange:[$\w]+\},null,8,\["binding","disabled","label"\]\),/g;
+
+export function patchMacHideShortcutSettings(source) {
+  // 1.0.3 renders one shortcut capture control as the first child of three setting-content rows
+  // (togglePet, gameMode, switchScreen). set_shortcut_capture is still a placeholder, so the
+  // controls are dropped and each row keeps only the switch it shipped before 1.0.3.
+  const actions = [...source.matchAll(SHORTCUT_CAPTURE_CALL)].map(match => match[1]);
+  const complete = SHORTCUT_CAPTURE_ACTIONS.every(action => actions.filter(hit => hit === action).length === 1);
+  if (actions.length !== SHORTCUT_CAPTURE_ACTIONS.length || !complete) {
+    throw new Error(`Original shortcut capture controls changed; found ${actions.length} of ${SHORTCUT_CAPTURE_ACTIONS.length} (${actions.join(', ') || 'none'}), reconcile the hidden shortcut settings before building.`);
+  }
+  return source.replace(SHORTCUT_CAPTURE_CALL, '');
 }
 
 export function patchGlobalAuthListener(source) {
@@ -172,3 +203,103 @@ export function patchMacLayoutBarriers(source) {
   return helper + source;
 }
 import { parse } from 'acorn';
+
+const PET_LOOP_HEAD = /function ([$\w]+)\(([$\w]+)\)\{const ([$\w]+)=Math\.min\(\(\2-([$\w]+)\)\/1e3,\.028\);\4=\2;/g;
+const PET_LOOP_WINDOW = 6000;
+
+export const MAC_FPS_CAP_MARK = 'WUWA_MAC_FPS_CAP';
+
+export const MAC_FPS_CAP_GATE = `/* ${MAC_FPS_CAP_MARK}: the room shell starts one self-scheduling animation-frame loop on mount and re-arms it forever, so the pet/emotion springs are integrated on every compositor frame (120 Hz on ProMotion) even when nothing is held. Frames that miss the budget are skipped before the spring integration and re-arm without touching the style objects, so no DOM write, layout or paint happens on a skipped frame; events, timers, network and Vue reactivity are untouched because only this loop consults the gate. A pressed emotion item keeps the stock frame rate, and a hidden document stops the beat. localStorage wuwa.fpsCap (integer 20-120) overrides the 30 fps default; anything else falls back to it. Delete this block and the two __wuwatappoFps* call sites to restore stock rendering. */
+const __wuwatappoFpsState={cap:0,gap:0,next:0,applied:0,readAt:-1e9};
+function __wuwatappoFpsCap(){
+const state=__wuwatappoFpsState,now=performance.now();
+if(state.cap&&now-state.readAt<500)return state.cap;
+let cap=30;
+try{const raw=localStorage.getItem("wuwa.fpsCap"),value=typeof raw==="string"?Number(raw.trim()):NaN;if(typeof raw==="string"&&raw.trim()!==""&&Number.isInteger(value)&&value>=20&&value<=120)cap=value}catch{}
+state.cap=cap;state.readAt=now;
+return cap
+}
+function __wuwatappoFpsStep(){return Math.max(.028,1.05/__wuwatappoFpsCap())}
+function __wuwatappoFpsGate(items){
+if(typeof document!=="undefined"&&document.visibilityState==="hidden")return!0;
+if(items)for(const item of items.values())if(item&&item.held)return!1;
+const state=__wuwatappoFpsState,cap=__wuwatappoFpsCap();
+if(cap!==state.applied){state.applied=cap;state.gap=1e3/cap*.9;state.next=0}
+const now=performance.now();
+if(now<state.next)return!0;
+state.next=now+state.gap;
+return!1
+}
+`;
+
+export function patchMacThrottleAnimation(source) {
+  if (source.includes(MAC_FPS_CAP_MARK)) throw new Error('Mac frame rate cap is already applied; reconcile the patch order before building.');
+  const heads = [...source.matchAll(PET_LOOP_HEAD)];
+  if (heads.length !== 1) throw new Error(`Original pet animation frame loop changed; found ${heads.length} loop heads, reconcile the Mac frame rate cap before building.`);
+  const [head, loop, stamp, step, last] = heads[0];
+  const scope = source.slice(heads[0].index, heads[0].index + PET_LOOP_WINDOW);
+  const items = /for\(const\[([$\w]+),([$\w]+)\]of ([$\w]+)\)/.exec(scope);
+  const arms = [...scope.matchAll(new RegExp(`([$\\w]+)=requestAnimationFrame\\(${loop}\\)`, 'g'))];
+  if (!items || arms.length !== 2 || arms[0][1] !== arms[1][1]) {
+    throw new Error('Original pet animation frame loop changed; reconcile the Mac frame rate cap before building.');
+  }
+  // A skipped frame must re-arm through the stock tail call, so the chunk keeps exactly the frame
+  // count it shipped with and L always holds a native handle for the unmount cancel.
+  const bodyStart = heads[0].index + head.length;
+  const armAt = heads[0].index + arms[0].index;
+  if (armAt <= bodyStart || source[armAt + `${arms[0][1]}=requestAnimationFrame(${loop})`.length] !== '}') {
+    throw new Error('Original pet animation frame loop changed; reconcile the Mac frame rate cap before building.');
+  }
+  const gated = `function ${loop}(${stamp}){if(!__wuwatappoFpsGate(${items[3]})){const ${step}=Math.min((${stamp}-${last})/1e3,__wuwatappoFpsStep());${last}=${stamp};`;
+  return `${MAC_FPS_CAP_GATE}${source.slice(0, heads[0].index)}${gated}${source.slice(bodyStart, armAt)}}${source.slice(armAt)}`;
+}
+
+const CHEST_COUNTDOWN = /([$\w]+)\.value=([$\w]+)===null\?([$\w]+)\(([$\w]+)\.userInfo\?\.(left_treasure_chest|right_treasure_chest),([$\w]+)\):Math\.max\(0,\2-([$\w]+)\)/g;
+
+export const MAC_CHEST_FALLBACK_MARK = 'WUWA_MAC_CHEST_FALLBACK';
+
+export function macChestFallbackHelper(clock = 'co') {
+  return `/* ${MAC_CHEST_FALLBACK_MARK}: activity_config_load_failed leaves the treasure chest timestamps at 0, so the stock projection collapses to 0 and the bubble renders without a countdown. A server deadline greater than 0 is recorded per side with its observation time; while the server sends nothing usable the last recorded deadline is reused for at most 90 minutes, then dropped. localStorage wuwa.chestFallback=off restores the stock projection and leaves the record alone. Only the two computed countdown values are routed here: the formatters, the progress ratio and the ring are untouched. Delete this block and the two __wuwatappoChestRemaining call sites to restore stock behaviour. */
+const __wuwatappoChestCache={left:{deadline:0,stamp:0},right:{deadline:0,stamp:0}};
+const __wuwatappoChestMaxAge=54e5;
+function __wuwatappoChestKey(side){return"wuwa.chestDeadline."+side}
+function __wuwatappoChestDisabled(){try{return localStorage.getItem("wuwa.chestFallback")==="off"}catch{return!1}}
+function __wuwatappoChestLoad(side){
+try{const raw=localStorage.getItem(__wuwatappoChestKey(side));if(typeof raw!=="string"||!raw)return null;const parsed=JSON.parse(raw),deadline=Number(parsed&&parsed.deadline),stamp=Number(parsed&&parsed.stamp);return Number.isFinite(deadline)&&Number.isFinite(stamp)&&deadline>0?{deadline,stamp}:null}catch{return null}
+}
+function __wuwatappoChestDrop(side){
+__wuwatappoChestCache[side].deadline=0;__wuwatappoChestCache[side].stamp=0;
+try{localStorage.removeItem(__wuwatappoChestKey(side))}catch{}
+}
+function __wuwatappoChestRemaining(side,raw,now){
+const value=raw==null?0:Number(raw);
+if(__wuwatappoChestDisabled())return ${clock}(raw,now);
+if(Number.isFinite(value)&&value>0){
+const deadline=Math.floor(value),cache=__wuwatappoChestCache[side],stamp=Date.now();
+if(cache.deadline!==deadline||stamp-cache.stamp>3e5){cache.deadline=deadline;cache.stamp=stamp;try{localStorage.setItem(__wuwatappoChestKey(side),JSON.stringify({deadline,stamp}))}catch{}}
+return ${clock}(raw,now)
+}
+const last=__wuwatappoChestLoad(side);
+if(last&&last.deadline>now&&Date.now()-last.stamp<=__wuwatappoChestMaxAge)return ${clock}(last.deadline,now);
+__wuwatappoChestDrop(side);
+return 0
+}
+`;
+}
+
+export function patchMacChestCountdownFallback(source) {
+  if (source.includes(MAC_CHEST_FALLBACK_MARK)) throw new Error('Mac chest countdown fallback is already applied; reconcile the patch order before building.');
+  const sites = [...source.matchAll(CHEST_COUNTDOWN)];
+  const sides = sites.map(match => match[5]).sort();
+  const clocks = new Set(sites.map(match => match[3]));
+  if (sites.length !== 2 || sides[0] !== 'left_treasure_chest' || sides[1] !== 'right_treasure_chest' || clocks.size !== 1) {
+    throw new Error(`Original treasure chest countdown projection changed; found ${sites.length} of 2 (${sites.map(match => match[5]).join(', ') || 'none'}), reconcile the Mac chest countdown fallback before building.`);
+  }
+  const clock = [...clocks][0];
+  if (!source.includes(`function ${clock}(e,t=is()){const o=No(e);return o<=0?0:Math.max(0,o-t)}`)) {
+    throw new Error('Original treasure chest countdown clock changed; reconcile the Mac chest countdown fallback before building.');
+  }
+  const patched = source.replace(CHEST_COUNTDOWN, (_, target, offset, helper, store, field, now, stamp) => `${target}.value=${offset}===null?__wuwatappoChestRemaining("${field === 'left_treasure_chest' ? 'left' : 'right'}",${store}.userInfo?.${field},${now}):Math.max(0,${offset}-${stamp})`);
+  return `${macChestFallbackHelper(clock)}${patched}`;
+}
+

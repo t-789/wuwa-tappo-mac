@@ -176,9 +176,10 @@ pub fn apply_float_over_fullscreen(app: &AppHandle, enabled: bool) -> Result<(),
 fn initialize(app: &AppHandle, label: &str) -> Result<String, String> {
     let script = app.state::<SessionStore>().initialization_script()?;
     let mut initialization = format!(
-        "{}\n{script}\n{}\n{}",
+        "{}\n{script}\n{}\n{}\n{}",
         crate::profile::Region::from_app(app).initialization_script(),
         include_str!("../../scripts/mac-websocket.js"),
+        include_str!("../../scripts/mac-http.js"),
         include_str!("../../scripts/mac-platform.js")
     );
     if label == "main" && cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--self-test")

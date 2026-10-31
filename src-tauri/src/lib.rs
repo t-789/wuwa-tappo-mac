@@ -1,10 +1,12 @@
 mod auth;
 mod geometry;
+mod http;
 mod input;
 mod menu;
 mod overlay;
 mod profile;
 mod session;
+mod shortcuts;
 mod socket;
 mod startup;
 mod storage;
@@ -149,6 +151,12 @@ const SYSTEM_COMMANDS: &[&str] = &[
     "set_elevated_autostart",
 ];
 
+const SHORTCUT_COMMANDS: &[&str] = &[
+    "get_app_shortcuts",
+    "set_app_shortcuts",
+    "set_shortcut_capture",
+];
+
 fn handle(invoke: Invoke) -> bool {
     let command = invoke.message.command().to_string();
     if command == "start_session" || command == "get_startup_status" {
@@ -178,6 +186,23 @@ fn handle(invoke: Invoke) -> bool {
         invoke
             .resolver
             .respond(result.map_err(tauri::ipc::InvokeError::from));
+        return true;
+    }
+    if SHORTCUT_COMMANDS.contains(&command.as_str()) {
+        let args = match invoke.message.payload() {
+            InvokeBody::Json(value) => value.clone(),
+            InvokeBody::Raw(_) => {
+                invoke
+                    .resolver
+                    .reject("Native commands require JSON arguments");
+                return true;
+            }
+        };
+        let app = invoke.message.webview().app_handle().clone();
+        let result = shortcuts::dispatch(&app, &command, &args)
+            .unwrap_or_else(|| Err(format!("Unhandled shortcut command {command}")))
+            .map_err(tauri::ipc::InvokeError::from);
+        invoke.resolver.respond(result);
         return true;
     }
     if windows::COMMANDS.contains(&command.as_str()) || SYSTEM_COMMANDS.contains(&command.as_str())
@@ -236,6 +261,8 @@ fn handle(invoke: Invoke) -> bool {
         socket::native_ws_connect,
         socket::native_ws_send,
         socket::native_ws_close,
+        http::native_http_request,
+        http::native_http_abort,
     ];
     handler(invoke)
 }
@@ -262,6 +289,7 @@ pub fn run() {
         .manage(StartupState::default())
         .manage(input::InputMonitor::new())
         .manage(socket::SocketState::default())
+        .manage(http::HttpState::default())
         .manage(region)
         .invoke_handler(handle);
     if region == profile::Region::Global {
@@ -275,6 +303,9 @@ pub fn run() {
             ));
             app.manage(overlay::OverlayState::new(
                 app.path().app_config_dir()?.join(overlay::FILE_NAME),
+            ));
+            app.manage(shortcuts::ShortcutState::new(
+                app.path().app_config_dir()?.join(shortcuts::FILE_NAME),
             ));
             // The activation policy has to settle before the windows and the tray
             // exist, otherwise the overlay window keeps the foreground process's

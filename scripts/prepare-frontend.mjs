@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { getRegionProfile } from './regions.mjs';
-import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost } from './patch-frontend.mjs';
+import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost, patchMacHideShortcutSettings, patchMacThrottleAnimation, patchMacChestCountdownFallback, patchMacNativeHttpAdapter } from './patch-frontend.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const profile = getRegionProfile();
@@ -18,7 +18,7 @@ const original = files.get(entry);
 if (!original?.includes(`const APP_REGION="${profile.region}"`)) throw new Error(`Expected official ${profile.region} frontend.`);
 let main = patchMacUpdater(original);
 main = profile.region === 'CN' ? patchDomesticSdkUrls(main) : patchGlobalAuthListener(main);
-files.set(entry, patchMacCountdownPaintPolicy(patchSessionBarriers(main)));
+files.set(entry, patchMacCountdownPaintPolicy(patchMacNativeHttpAdapter(patchSessionBarriers(main))));
 
 function patchOne(description, matches, patch) {
   const selected = [...files].filter(([name, content]) => matches(name, content));
@@ -28,9 +28,12 @@ function patchOne(description, matches, patch) {
 }
 
 patchOne('modal event bridge', name => /\/modalBridge-[^/]+\.js$/.test(name), patchLoginReady);
-patchOne('update feedback view', (_, content) => /\.value=n\("setting_version_check_failed"\)/.test(content), patchMacUpdateFeedback);
+patchOne('update feedback view', (_, content) => /\.value=[$\w]+\("setting_version_check_failed"\)/.test(content), patchMacUpdateFeedback);
 patchOne('About view', (_, content) => /t=[$\w]+\(\(\)=>k\("about_content"\)/.test(content), content => patchMacAbout(content, profile.region));
 patchOne('main layout view', (_, content) => content.includes('[main] window layout during open failed'), patchMacLayoutBarriers);
+patchOne('shortcut settings view', (_, content) => content.includes('action:"switchScreen"'), patchMacHideShortcutSettings);
+patchOne('pet animation frame loop', (_, content) => /Math\.min\(\([$\w]+-[$\w]+\)\/1e3,\.028\)/.test(content), patchMacThrottleAnimation);
+patchOne('treasure chest countdown projection', (_, content) => /===null\?[$\w]+\([$\w]+\.userInfo\?\.left_treasure_chest,/.test(content), patchMacChestCountdownFallback);
 if (profile.region === 'CN') patchOne('domestic SDK loader', (name, content) => name !== entry && content.includes('t.dataset.kuroSdkRetry="true"'), patchDomesticLoginReload);
 patchOne('countdown stylesheet', (name, content) => name.endsWith('.css') && content.includes('.reward-countdown .reward-countdown__bar'), patchMacCountdownPaintCost);
 
