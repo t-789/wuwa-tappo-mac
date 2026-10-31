@@ -9,11 +9,11 @@ import { contract, profile, root, assetDirectory } from './frontend-context.mjs'
 const runtimeCommands = contract.commands.filter(item => item.kind === 'application' && item.scopes.includes('application-runtime'));
 
 test('selected region runtime and Windows installer have separate exhaustive inventories', () => {
-  assert.equal(runtimeCommands.length, 50);
+  assert.equal(runtimeCommands.length, 53);
   assert.equal(contract.commands.filter(item => item.kind === 'application' && item.scopes.includes('windows-installer')).length, profile.id === 'cn' ? 9 : 11);
-  assert.equal(contract.commands.filter(item => item.kind === 'plugin').length, profile.id === 'cn' ? 119 : 120);
-  // Named-event surface per pinned upstream: cn 1.0.2 exposes 60 (1.0.1 had 59), global is still pinned to 1.0.1 with 60.
-  const expectedEvents = { cn: 60, global: 60 };
+  assert.equal(contract.commands.filter(item => item.kind === 'plugin').length, profile.id === 'cn' ? 116 : 120);
+  // Named-event surface per pinned upstream: cn 1.0.3 exposes 63 (1.0.2 had 60), global is still pinned to 1.0.1 with 60.
+  const expectedEvents = { cn: 63, global: 60 };
   assert.equal(contract.events.length, expectedEvents[profile.id]);
   assert.equal(contract.sourceApplication.region, profile.region);
   assert.equal(contract.sourceApplication.version, JSON.parse(fs.readFileSync(path.join(root, profile.upstreamLock), 'utf8')).version);
@@ -42,7 +42,8 @@ test('all command and event evidence preserves JavaScript and UTF-8 byte ranges'
     assert.ok(site.context.includes(site.source));
   }
   assert.ok(contract.commands.find(item => item.name === 'get_boot_diagnostics').callSites.some(site => site.callee !== 'invoke'));
-  assert.ok(contract.commands.find(item => item.name === 'open_panel_window').callSites.some(site => site.callee === '_'));
+  // The minified alias for the exported invoke changes per build (1.0.2 "_", 1.0.3 "u"), so assert the shape.
+  assert.ok(contract.commands.find(item => item.name === 'open_panel_window').callSites.some(site => site.callee !== 'invoke'));
 });
 
 test('remaining dynamic invoke sites are framework plugin factories rather than missing application commands', () => {

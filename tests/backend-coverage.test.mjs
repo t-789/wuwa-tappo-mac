@@ -16,11 +16,12 @@ test('every application runtime command has a macOS handler', async () => {
   assert.deepEqual(missing, []);
 });
 
-test('session flush barriers cover both SDK invoke wrappers without changing native internals', () => {
+test('session flush barriers cover the SDK invoke wrapper without changing native internals', () => {
+  // 1.0.3 keeps one invoke wrapper in the entry module; the plugin-dialog copy moved to its own chunk.
   const wrapper = name => `async function ${name}(e,t={},n){return window.__TAURI_INTERNALS__.invoke(e,t,n)}`;
-  const source = `${wrapper('invoke$1')}${wrapper('invoke')}`;
+  const source = wrapper('invoke');
   const result = patchSessionBarriers(source);
-  assert.equal((result.match(/SESSION__\?\.flush\(\)/g) || []).length, 2);
+  assert.equal((result.match(/SESSION__\?\.flush\(\)/g) || []).length, 1);
   assert.ok(result.includes('cat-auth-login-success'));
   assert.ok(result.includes('cat-auth-logout'));
   assert.ok(result.includes('open_login_window'));
@@ -28,7 +29,7 @@ test('session flush barriers cover both SDK invoke wrappers without changing nat
 });
 
 test('unknown upstream wrapper versions fail the build instead of dropping the barrier', () => {
-  assert.throws(() => patchSessionBarriers('async function invoke(){}'), /Expected 2/);
+  assert.throws(() => patchSessionBarriers('async function invoke(){}'), /Expected 1/);
 });
 
 test('first login waits for the Vue modal listener rather than a page-load timer', () => {
