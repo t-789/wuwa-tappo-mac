@@ -54,7 +54,9 @@ test('the diagnostics block sits behind the render gate and moves no existing st
   assert.equal(inserted.startsWith('\n/* ' + MAC_CHEST_DIAGNOSTICS_MARK + ':'), true);
   const end = inserted.indexOf(helperTail) + helperTail.length;
   assert.equal(inserted.slice(end), fixture.slice(head.length));
-  assert.equal(patched.includes('localStorage.getItem("wuwa.chestDbg")==="off"'), true);
+  assert.equal(patched.includes('const __wuwatappoChestDbgOn=(()=>{try{const value=localStorage.getItem("wuwa.chestDbg");return value==="on"||value==="1"}catch{return!1}})();'), true);
+  assert.equal(patched.split('localStorage.getItem("wuwa.chestDbg")').length - 1, 1, 'the switch is read once, not on every tick');
+  assert.equal(patched.includes('localStorage.getItem("wuwa.chestDbg")==="off"'), false, 'the old default-on kill switch is gone');
   assert.equal(patched.split('localStorage.setItem("wuwa.chestDbg"').length - 1, 1);
   parse(patched, { sourceType: 'module', ecmaVersion: 'latest' });
 });
@@ -75,7 +77,7 @@ test('a bundle without the chest gates stops preparation', () => {
 });
 
 test('the snapshot is taken every five seconds and carries the whole gate state', () => {
-  const h = harness();
+  const h = harness({ storage: { 'wuwa.chestDbg': 'on' } });
   assert.equal(h.timers.length, 1);
   assert.equal(h.timers[0].ms, 5000);
   h.timers[0].fn();
@@ -102,7 +104,7 @@ test('the snapshot is taken every five seconds and carries the whole gate state'
 });
 
 test('the observer touches nothing but its own key, and every tick refreshes the timestamp', () => {
-  const h = harness();
+  const h = harness({ storage: { 'wuwa.chestDbg': 'on' } });
   const before = JSON.stringify({ loggedIn: h.context.R.isLoggedIn, userInfo: h.context.R.userInfo });
   h.timers[0].fn();
   h.timers[0].fn();
@@ -113,20 +115,30 @@ test('the observer touches nothing but its own key, and every tick refreshes the
   assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).t, 1700000005000);
 });
 
-test('wuwa.chestDbg=off suppresses the write until the key is cleared', () => {
-  const h = harness({ storage: { 'wuwa.chestDbg': 'off' } });
-  h.timers[0].fn();
-  assert.equal(h.entries.get('wuwa.chestDbg'), 'off');
-  assert.equal(h.entries.size, 1);
-  h.entries.delete('wuwa.chestDbg');
-  h.timers[0].fn();
-  assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).isLoggedIn, true);
+test('the snapshot is written only when the switch holds exactly "on" or "1"', () => {
+  for (const value of [null, '', 'off', 'true', 'ON', 'yes', 'on ', ' 1']) {
+    const h = harness(value === null ? {} : { storage: { 'wuwa.chestDbg': value } });
+    h.timers[0].fn();
+    assert.equal(h.entries.get('wuwa.chestDbg') ?? null, value, 'switch ' + JSON.stringify(value) + ' leaves the key untouched');
+  }
+  for (const value of ['on', '1']) {
+    const h = harness({ storage: { 'wuwa.chestDbg': value } });
+    h.timers[0].fn();
+    assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).isLoggedIn, true, 'switch ' + value + ' arms the snapshot');
+  }
+});
+
+test('an unarmed load writes nothing at all, not even once', () => {
+  const h = harness();
+  for (let tick = 0; tick < 3; tick += 1) h.timers[0].fn();
+  assert.equal(h.entries.size, 0);
+  assert.equal(h.timers[0].ms, 5000);
 });
 
 test('a hidden document is skipped', () => {
-  const h = harness({ hidden: true });
+  const h = harness({ hidden: true, storage: { 'wuwa.chestDbg': 'on' } });
   h.timers[0].fn();
-  assert.equal(h.entries.has('wuwa.chestDbg'), false);
+  assert.equal(h.entries.get('wuwa.chestDbg'), 'on', 'a hidden document keeps the armed switch and writes nothing');
 });
 
 test('the shipped room bundle anchors once and keeps every assignment and formatter intact', () => {
@@ -267,7 +279,7 @@ test('wuwa.chestReadyFix=off leaves the stock slot alone and records nothing', a
 
 test('the snapshot carries the refresher view when the guard publishes one, and survives a throwing probe', () => {
   const view = { inflight: true, ageMs: 1500, calls: 3, runs: 1, settles: 0, failures: 1, expired: 0, error: 'timeout', errorName: 'Error', code: 'ETIMEDOUT', force: true, done: false, gate: 'offline' };
-  const h = harness();
+  const h = harness({ storage: { 'wuwa.chestDbg': 'on' } });
   h.context.__wuwatappoChestXoProbe = () => view;
   h.timers[0].fn();
   assert.deepEqual(JSON.parse(h.entries.get('wuwa.chestDbg')).xo, view);
