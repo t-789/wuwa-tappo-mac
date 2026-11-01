@@ -25,8 +25,9 @@ const fixture = [
   '',
 ].join('');
 
-function harness({ storage = {}, wall = 1700000000000, failStore = false, failure = null } = {}) {
-  const entries = new Map(Object.entries(storage));
+// The record is opt-in, so a test that expects an entry arms the shared switch first.
+function harness({ storage = {}, wall = 1700000000000, failStore = false, failure = null, armed = true } = {}) {
+  const entries = new Map(Object.entries(armed ? { 'wuwa.chestDbg': 'on', ...storage } : storage));
   const calls = [];
   const ref = value => ({ value });
   const error = failure ?? Object.assign(new Error('chest cooling down'), { code: '70002' });
@@ -66,6 +67,9 @@ test('the recorder is the only change and it sits ahead of the stock code dispat
   const patched = patchMacChestClickDiagnostics(fixture);
   assert.equal(patched.split(MAC_CHEST_CLICK_DIAG_MARK).length - 1, 1);
   assert.equal(patched.split('__wuwatappoChestClickRecord(').length - 1, 2, 'one definition and one call site');
+  assert.equal(patched.split('localStorage.getItem("wuwa.chestDbg")').length - 1, 1, 'the shared switch is read once');
+  assert.equal(patched.includes('const __wuwatappoChestClickOn=(()=>{try{const __wuwatappoChestClickRaw=localStorage.getItem("wuwa.chestDbg");return __wuwatappoChestClickRaw==="on"||__wuwatappoChestClickRaw==="1"}catch{return!1}})();'), true, 'the record is opt-in, not default-on');
+  assert.equal(patched.includes('function __wuwatappoChestClickRecord(side,code,failure){\ntry{\nif(!__wuwatappoChestClickOn)return;'), true, 'the guard runs before the list is built');
   assert.equal(patched.includes('const j=od(M);__wuwatappoChestClickRecord(e,j,M);j!=null?go(String(j)):go("api_error")'), true);
   const head = fixture.slice(0, fixture.indexOf('async function pc('));
   const tail = fixture.slice(fixture.indexOf('async function pc('))
@@ -97,6 +101,32 @@ test('a failed click records the shape the diagnosis needs', async () => {
   assert.deepEqual(calls.map(([kind]) => kind), ['event', 'go', 'report']);
   assert.deepEqual(calls[1], ['go', '70002']);
   assert.deepEqual(calls[2][1], error, 'the stock reporter still gets the error it always got');
+});
+
+test('an unarmed build never appends a record and never reads its own key', async () => {
+  const bare = harness({ armed: false });
+  await bare.context.__click('left');
+  assert.equal(bare.entries.size, 0, 'no switch, no record');
+  const off = harness({ armed: false, storage: { 'wuwa.chestDbg': 'off' } });
+  await off.context.__click('left');
+  assert.deepEqual([...off.entries], [['wuwa.chestDbg', 'off']], 'the off value is left exactly as it was');
+  for (const value of ['on', '1']) {
+    const on = harness({ armed: false, storage: { 'wuwa.chestDbg': value } });
+    await on.context.__click('left');
+    assert.equal(on.records().length, 1, 'switch ' + JSON.stringify(value) + ' arms the record');
+  }
+  for (const value of ['yes', 'OFF ', '']) {
+    const junk = harness({ armed: false, storage: { 'wuwa.chestDbg': value } });
+    await junk.context.__click('left');
+    assert.equal(junk.records().length, 0, 'switch ' + JSON.stringify(value) + ' is not a switch');
+  }
+  const spy = harness({ armed: false });
+  spy.context.localStorage.getItem = key => {
+    if (key === 'wuwa.chestClick') throw new Error('the record key was read while unarmed');
+    return null;
+  };
+  assert.equal(await spy.context.__click('left'), undefined);
+  assert.equal(spy.entries.size, 0, 'the unarmed path never touches the record key');
 });
 
 test('the recorded side follows the clicked chest', async () => {

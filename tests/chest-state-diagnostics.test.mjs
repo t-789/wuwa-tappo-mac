@@ -55,6 +55,11 @@ function harness({ storage = {}, hidden = false, source = fixture, patch = patch
   return { context, entries, timers, wall };
 }
 
+// The snapshot is opt-in, so a test that expects a write has to arm the switch first.
+function armed({ storage = {}, ...rest } = {}) {
+  return harness({ ...rest, storage: { 'wuwa.chestDbg': 'on', ...storage } });
+}
+
 test('the block sits behind the render gate and appends one statement to the claim path', () => {
   const patched = patchMacChestStateDiagnostics(fixture);
   assert.equal(patched.split(MAC_CHEST_DIAGNOSTICS_MARK).length - 1, 1);
@@ -68,9 +73,10 @@ test('the block sits behind the render gate and appends one statement to the cla
   assert.equal(inserted.startsWith('\n/* ' + MAC_CHEST_DIAGNOSTICS_MARK + ':'), true);
   const end = inserted.indexOf(helperTail) + helperTail.length;
   assert.equal(inserted.slice(end), anchored.slice(head.length));
-  assert.equal(patched.includes('const __wuwatappoChestDbgOn=(()=>{try{return localStorage.getItem("wuwa.chestDbg")!=="off"}catch{return!0}})();'), true);
+  assert.equal(patched.includes('const __wuwatappoChestDbgOn=(()=>{try{const __wuwatappoChestDbgRaw=localStorage.getItem("wuwa.chestDbg");return __wuwatappoChestDbgRaw==="on"||__wuwatappoChestDbgRaw==="1"}catch{return!1}})();'), true, 'the switch is opt-in again');
   assert.equal(patched.split('localStorage.getItem("wuwa.chestDbg")').length - 1, 1, 'the switch is read once, not on every tick');
-  assert.equal(patched.includes('==="on"||value==="1"'), false, 'the opt-in switch is gone for this round');
+  assert.equal(patched.includes('!=="off"'), false, 'the default-on kill switch is gone');
+  assert.equal(patched.includes('function __wuwatappoChestClaim(side){\ntry{\nif(!__wuwatappoChestDbgOn)return;\nconst isLeft='), true, 'the claim record reads the switch before it builds anything');
   assert.equal(patched.split('localStorage.setItem("wuwa.chestDbg"').length - 1, 1);
   assert.equal(patched.split('localStorage.setItem(__wuwatappoChestClaimKey').length - 1, 1);
   parse(patched, { sourceType: 'module', ecmaVersion: 'latest' });
@@ -141,35 +147,38 @@ test('the observer touches nothing but its own key, and every tick refreshes the
   assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).t, 1700000005000);
 });
 
-test('the snapshot is written by default and only the exact "off" switch silences it', () => {
-  for (const value of [null, '', 'on', '1', 'off ', 'OFF']) {
-    const h = harness(value === null ? {} : { storage: { 'wuwa.chestDbg': value } });
+test('only the exact "on" or "1" switch arms the snapshot, and nothing else writes a byte', () => {
+  for (const value of ['on', '1']) {
+    const h = harness({ storage: { 'wuwa.chestDbg': value } });
     h.timers[0].fn();
     assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).isLoggedIn, true, 'switch ' + JSON.stringify(value) + ' arms the snapshot');
   }
-  const off = harness({ storage: { 'wuwa.chestDbg': 'off' } });
-  off.timers[0].fn();
-  assert.equal(off.entries.get('wuwa.chestDbg'), 'off', 'the kill switch leaves the key untouched');
+  for (const value of [null, '', 'off', 'off ', 'OFF', 'true', '0', '{"t":1}']) {
+    const h = harness(value === null ? {} : { storage: { 'wuwa.chestDbg': value } });
+    for (let tick = 0; tick < 3; tick += 1) h.timers[0].fn();
+    assert.deepEqual([...h.entries], value === null ? [] : [['wuwa.chestDbg', value]], 'switch ' + JSON.stringify(value) + ' is unarmed and writes nothing');
+  }
 });
 
-test('an empty store is armed, and the kill switch stays quiet for every tick', () => {
-  const h = harness();
-  for (let tick = 0; tick < 3; tick += 1) h.timers[0].fn();
-  assert.equal(JSON.parse(h.entries.get('wuwa.chestDbg')).tick, 3);
-  assert.equal(h.timers[0].ms, 5000);
+test('an unarmed build builds no claim list and reads no key', () => {
   const off = harness({ storage: { 'wuwa.chestDbg': 'off' } });
-  for (let tick = 0; tick < 3; tick += 1) off.timers[0].fn();
-  assert.deepEqual([...off.entries], [['wuwa.chestDbg', 'off']]);
+  off.context.Cp('left');
+  assert.deepEqual([...off.entries], [['wuwa.chestDbg', 'off']], 'the claim record stays silent');
+  const empty = harness();
+  empty.context.Cp('left');
+  empty.timers[0].fn();
+  assert.equal(empty.entries.size, 0, 'an empty store stays empty, timer or not');
+  assert.equal(empty.timers[0].ms, 5000, 'the timer still arms, it just writes nothing');
 });
 
 test('a hidden document is skipped', () => {
-  const h = harness({ hidden: true });
+  const h = armed({ hidden: true });
   h.timers[0].fn();
-  assert.equal(h.entries.size, 0, 'a hidden document keeps the armed switch and writes nothing');
+  assert.deepEqual([...h.entries], [['wuwa.chestDbg', 'on']], 'a hidden document keeps the armed switch and writes nothing');
 });
 
 test('every snapshot counts itself and carries the cooldown, the clock and the raw anchors', () => {
-  const h = harness();
+  const h = armed();
   h.timers[0].fn();
   h.timers[0].fn();
   h.wall.value += 5000;
@@ -181,7 +190,7 @@ test('every snapshot counts itself and carries the cooldown, the clock and the r
 });
 
 test('a claim writes its anchor and one three field record, keeping the last three', () => {
-  const h = harness();
+  const h = armed();
   h.context.Cp('left');
   assert.deepEqual(JSON.parse(h.entries.get('wuwa.chestClaim')), [
     { t: 1700000000000, side: 'left', fr: 1800000, anchorAfter: 1700001800000, remainingAfter: 1800000, raw: 5000000 },
@@ -200,7 +209,7 @@ test('a claim writes its anchor and one three field record, keeping the last thr
 });
 
 test('a store that refuses its own key never reaches the claim path', () => {
-  const h = harness();
+  const h = armed();
   const store = h.context.localStorage;
   const { setItem, getItem } = store;
   store.setItem = () => { throw new Error('quota'); };
@@ -305,7 +314,7 @@ test('a bundle without the stock tick stops preparation', () => {
 });
 
 test('the snapshot carries the tick beat count next to the anchors', () => {
-  const withBeat = () => harness({ source: tickSource, patch: source => patchMacChestStateDiagnostics(patchMacChestVnBeat(source)) });
+  const withBeat = () => armed({ source: tickSource, patch: source => patchMacChestStateDiagnostics(patchMacChestVnBeat(source)) });
   const h = withBeat();
   h.timers[0].fn();
   let snapshot = JSON.parse(h.entries.get('wuwa.chestDbg'));
@@ -316,7 +325,7 @@ test('the snapshot carries the tick beat count next to the anchors', () => {
   h.timers[0].fn();
   snapshot = JSON.parse(h.entries.get('wuwa.chestDbg'));
   assert.deepEqual([snapshot.vn, snapshot.vnAt, snapshot.anchorL], [2, 1700000000000, null], 'the beat is readable beside the frozen anchor');
-  const without = harness();
+  const without = armed();
   without.timers[0].fn();
   const plain = JSON.parse(without.entries.get('wuwa.chestDbg'));
   assert.deepEqual([plain.vn, plain.vnAt], [null, null], 'a build without the beat reads null instead of throwing');

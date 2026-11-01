@@ -84,3 +84,17 @@
 1. **倒计时进度环的重绘成本**：官方样式里 `.reward-countdown__bar` 有 `transition:stroke-dasharray .9s linear`，而 `--progress` 每秒改一次，等于约 54 次/秒重绘；该层又叠着 `filter:drop-shadow(...)` 两次，滤镜使 WebKit 无法复用 tile，必须整层重新栅格化。桌宠窗口是整屏透明覆盖层（一张整窗 backing store ≈ 33MB），于是 GPU 进程里的 IOSurface 只增不减。修复见 `patchMacCountdownPaintCost`（去掉滤镜 + 去过渡，重绘降到 1 次/秒）。
 2. **激活策略的时机决定窗口能否进入别人的全屏 Space**：进程必须是 Accessory（`LSUIElement` 等价）**并且**在建窗之前就已是 Accessory；之后无论怎么改 `collectionBehavior`（`canJoinAllSpaces | fullScreenAuxiliary`）或 `NSWindow.level` 都无效——窗口已被判定为桌面 Space 的窗口。层级不是关键（level 3 即可）。见 `windows::sync_activation_policy`。
 3. **层级不要与 tao 抢**：tao 0.37.2 把 `kCGFloatingWindowLevelKey` 直接当 level 用，并通过 `dispatch_async` 异步写主队列，因此任何同步 `setLevel` 都可能被 `set_always_on_top` 异步写回。主窗口的层级应由单一函数独占写入。
+
+### 补丁注入点必须做作用域可达性检查（2026-11-01 踩坑）
+
+症状：宝箱领取后倒计时冻结在 30:00、重启后显示成可领取却被服务端回 70006（Chest is on cooldown）。
+
+真因：兜底 helper 被注入到模块顶层，却调用了只在组件 setup 作用域内可见的局部函数 co()。Vn() 每秒调用它都会抛 ReferenceError，于是在给 Nt/Ht 赋值之前就中断；数值只保留上一个写入者留下的值（Cp() 写的 fr，或初始 0）。
+
+教训与做法：
+
+1) 注入 helper 前，先用 acorn 确认它要引用的每个符号都在同一或外层作用域可达：解析产物后找出 helper 与目标符号各自最内层函数节点，若目标符号的祖先函数不是 helper 的祖先函数，就不可见。
+2) 注入在顶层的 helper 只能依赖 globalThis、标准库与它自己注入的兄弟函数；不要引用压缩后的局部名（co / is / No 这类既是局部又可能被改名的符号）。
+3) 兜底算术宁可在 helper 内联重写一遍（并与上游语义做等价表测试），也不要跨作用域取用。
+4) 写一条能区分新旧实现的测试：在没有该局部符号的 vm 上下文里求值，旧实现必须抛 ReferenceError，新实现必须返回正确值。只断言现在能过的测试抓不到这类 bug。
+5) 调试顺序上，先静态验证作用域与符号可达性，再进入运行期二分；这一步早做可以省下数小时。
