@@ -122,9 +122,7 @@ pub fn sync_activation_policy(app: &AppHandle) -> Result<(), String> {
     const REGULAR: isize = 0;
     let mtm = objc2::MainThreadMarker::new()
         .ok_or("Activation policy must be changed on the main thread")?;
-    let hidden = app
-        .try_state::<WindowState>()
-        .is_some_and(|state| state.dock_icon_hidden.load(Ordering::Acquire));
+    let hidden = taskbar_icon_hidden(app);
     let accessory = crate::overlay::enabled(app) || hidden;
     let policy = if accessory { ACCESSORY } else { REGULAR };
     let application = NSApplication::sharedApplication(mtm);
@@ -138,6 +136,14 @@ pub fn sync_activation_policy(app: &AppHandle) -> Result<(), String> {
     // `setActivationPolicy:`; the process-type transform is the documented way
     // back, and tauri already wraps it for the Dock-tile preference.
     app.set_dock_visibility(!accessory).map_err(err)
+}
+
+/// `show_taskbar_icon` is stored inverted: the flag says the Dock tile was taken away. macOS has
+/// no taskbar, so setting it only moves the activation policy — which leaves the menu bar icon as
+/// the last entry point once the pet is hidden.
+pub(crate) fn taskbar_icon_hidden(app: &AppHandle) -> bool {
+    app.try_state::<WindowState>()
+        .is_some_and(|state| state.dock_icon_hidden.load(Ordering::Acquire))
 }
 
 /// An `always_on_top` window still sits behind another app's fullscreen Space.
@@ -708,12 +714,16 @@ pub fn dispatch(
             state.dock_icon_hidden.store(false, Ordering::Release);
             sync_activation_policy(app)?;
             main_window(app)?.set_skip_taskbar(false).map_err(err)?;
+            // Hiding the Dock tile must never take the menu bar icon with it while the pet is off
+            // screen, so the tray follows every change of this preference.
+            crate::menu::sync_tray_visibility(app)?;
         }
         "set_main_skip_taskbar" => {
             let skip = args.get("skip").and_then(Value::as_bool).ok_or("Missing skip state")?;
             state.dock_icon_hidden.store(skip, Ordering::Release);
             sync_activation_policy(app)?;
             main_window(app)?.set_skip_taskbar(skip).map_err(err)?;
+            crate::menu::sync_tray_visibility(app)?;
         }
         "show_toast_overlay" => {
             let w = if let Some(w) = app.get_webview_window("toast") {

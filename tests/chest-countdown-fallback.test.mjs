@@ -11,9 +11,14 @@ const clock = 'function is(){return 0}function No(e){if(e==null)return 0;const t
 const formatters = 'function rc(e){const t=Math.floor(e/60),o=e%60;return(t<10?"0"+t:t)+":"+(o<10?"0"+o:o)}function ic(e){return Math.max(0,Math.ceil(e/1e3))}function ac(e,t){return e<=0||t<=0?0:Math.min(1,Math.max(0,e/t))}';
 const projection = 'function Vn(){const e=is(),t=performance.now();Nt.value=kr===null?co(R.userInfo?.left_treasure_chest,e):Math.max(0,kr-t),Ht.value=Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t),Yr("left",Nt.value)}';
 const fixture = clock + formatters + projection + '\n';
+// The later of the two sources wins on both sides: the server projection (with its recorded
+// fallback) and the anchor a successful open writes. `wuwa.chestFallback=off` keeps the stock
+// projection verbatim, anchor first.
 const rewritten = projection
-  .replace('co(R.userInfo?.left_treasure_chest,e)', '__wuwatappoChestRemaining("left",R.userInfo?.left_treasure_chest,e)')
-  .replace('co(R.userInfo?.right_treasure_chest,e)', '__wuwatappoChestRemaining("right",R.userInfo?.right_treasure_chest,e)');
+  .replace('kr===null?co(R.userInfo?.left_treasure_chest,e):Math.max(0,kr-t)',
+    '__wuwatappoChestDisabled()?kr===null?co(R.userInfo?.left_treasure_chest,e):Math.max(0,kr-t):Math.max(__wuwatappoChestRemaining("left",R.userInfo?.left_treasure_chest,e),kr===null?0:Math.max(0,kr-t))')
+  .replace('Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t)',
+    '__wuwatappoChestDisabled()?Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t):Math.max(__wuwatappoChestRemaining("right",R.userInfo?.right_treasure_chest,e),Cr===null?0:Math.max(0,Cr-t))');
 const helper = macChestFallbackHelper('co');
 
 // Mirrors the shipped No()/co() pair the injected helper calls, so the branches under test are the
@@ -45,8 +50,11 @@ test('both chest projections route through the fallback helper and nothing else 
   assert.equal(patched, helper + fixture.replace(projection, rewritten));
   assert.equal(patched.split(MAC_CHEST_FALLBACK_MARK).length - 1, 1);
   assert.equal(patched.split('__wuwatappoChestRemaining(').length - 1, 3);
-  assert.equal(patched.split('Math.max(0,kr-t)').length - 1, 1);
-  assert.equal(patched.split('Math.max(0,Cr-t)').length - 1, 1);
+  // Each side keeps the stock anchor projection twice: once as the verbatim off switch, once as
+  // the anchor half of the merge.
+  assert.equal(patched.split('Math.max(0,kr-t)').length - 1, 2);
+  assert.equal(patched.split('Math.max(0,Cr-t)').length - 1, 2);
+  assert.equal(patched.split('Math.max(__wuwatappoChestRemaining(').length - 1, 2);
   assert.equal(patched.split(clock).length - 1, 1);
   assert.equal(patched.includes(formatters), true);
   parse(patched, { sourceType: 'module', ecmaVersion: 'latest' });
@@ -134,14 +142,93 @@ test('the shipped room bundle carries both countdown sites and keeps the formatt
   ]) {
     assert.equal(patched.split(anchor).length - 1, source.split(anchor).length - 1, anchor);
   }
+  // One extra read per side: the off switch and the merged server half both name the field.
   for (const field of ['left_treasure_chest', 'right_treasure_chest']) {
-    assert.equal(patched.split(field).length - 1, source.split(field).length - 1, field);
+    assert.equal(patched.split(field).length - 1, source.split(field).length, field);
   }
   assert.equal(source.split('?co(R.userInfo?.left_treasure_chest,e)').length - 1, 1);
-  assert.equal(patched.split('?co(R.userInfo?.left_treasure_chest,e)').length - 1, 0);
-  assert.equal(patched.split('__wuwatappoChestRemaining("left",R.userInfo?.left_treasure_chest,e)').length - 1, 1);
-  assert.equal(patched.split('__wuwatappoChestRemaining("right",R.userInfo?.right_treasure_chest,e)').length - 1, 1);
+  assert.equal(patched.split('__wuwatappoChestDisabled()?kr===null?co(R.userInfo?.left_treasure_chest,e):Math.max(0,kr-t):Math.max(__wuwatappoChestRemaining("left",R.userInfo?.left_treasure_chest,e),kr===null?0:Math.max(0,kr-t))').length - 1, 1);
+  assert.equal(patched.split('__wuwatappoChestDisabled()?Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t):Math.max(__wuwatappoChestRemaining("right",R.userInfo?.right_treasure_chest,e),Cr===null?0:Math.max(0,Cr-t))').length - 1, 1);
+  // The helper's own off switch plus one per side: the merge never runs while the switch is off.
+  assert.equal(patched.split('__wuwatappoChestDisabled()').length - 1, 4);
   parse(patched, { sourceType: 'module', ecmaVersion: 'latest' });
   const prepare = readFileSync(path.join(root, 'scripts', 'prepare-frontend.mjs'), 'utf8');
   assert.ok(prepare.includes("patchOne('treasure chest countdown projection', (_, content) => /===null\\?[$\\w]+\\([$\\w]+\\.userInfo\\?\\.left_treasure_chest,/.test(content), patchMacChestCountdownFallback);"));
 });
+
+// Runs the shipped rewrite end to end: the injected helper plus the patched projection, with the
+// stock `is()` fixture clock (0) standing in for Date.now and a controllable performance.now.
+// `kr`/`Cr` are the local anchors a successful open writes.
+const patchedProjection = patchMacChestCountdownFallback(fixture);
+
+function projectionHarness({ storage = {}, now = 0, leftChest = 0, rightChest = 0 } = {}) {
+  const entries = new Map(Object.entries(storage));
+  const context = {
+    localStorage: {
+      getItem: key => (entries.has(key) ? entries.get(key) : null),
+      setItem: (key, value) => entries.set(key, String(value)),
+      removeItem: key => entries.delete(key),
+    },
+    Date: { now: () => 1_700_000_000_000 },
+    performance: { now: () => context.now },
+    R: { userInfo: { left_treasure_chest: leftChest, right_treasure_chest: rightChest } },
+    Nt: { value: -1 },
+    Ht: { value: -1 },
+    Yr: () => {},
+    kr: null,
+    Cr: null,
+    now,
+  };
+  vm.createContext(context);
+  vm.runInContext(patchedProjection, context);
+  context.entries = entries;
+  return context;
+}
+
+test('a live server deadline keeps the gate closed even when the local anchor is spent', () => {
+  const h = projectionHarness({ leftChest: 5_000_000, now: 0 });
+  h.kr = 2_000;
+  h.Vn();
+  assert.equal(h.Nt.value, 5_000_000);
+  assert.equal(h.Nt.value > 0, true);
+});
+
+test('a local anchor that outlasts the server keeps the bubble closed instead of reopening it', () => {
+  const h = projectionHarness({ now: 1_000, rightChest: 6_000_000 });
+  h.kr = 1_000 + 9_000_000;
+  h.Vn();
+  assert.equal(h.Nt.value, 9_000_000);
+  // The other side keeps its own sources: a spent anchor loses to the later server projection.
+  h.Cr = 1_000 + 4_000;
+  h.Vn();
+  assert.equal(h.Nt.value, 9_000_000);
+  assert.equal(h.Ht.value, 6_000_000);
+});
+
+test('the gate only reads as ready when both sources are spent', () => {
+  const h = projectionHarness({ now: 5_000 });
+  h.Vn();
+  assert.equal(h.Nt.value, 0);
+  assert.equal(h.Nt.value <= 0, true);
+  // An anchor in the past is not a source either.
+  h.kr = 1_000;
+  h.Vn();
+  assert.equal(h.Nt.value, 0);
+});
+
+test('wuwa.chestFallback=off keeps the stock projection verbatim, anchor first', () => {
+  const h = projectionHarness({
+    storage: { 'wuwa.chestFallback': 'off' },
+    leftChest: 5_000_000,
+    now: 0,
+  });
+  h.kr = 2_000;
+  h.Vn();
+  assert.equal(h.Nt.value, 2_000);
+  assert.equal(h.entries.has('wuwa.chestDeadline.left'), false);
+  h.kr = null;
+  h.Vn();
+  assert.equal(h.Nt.value, 5_000_000);
+  assert.equal(h.entries.has('wuwa.chestDeadline.left'), false);
+});
+

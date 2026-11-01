@@ -333,6 +333,40 @@ fn with_overlay(app: &AppHandle, mut options: MenuOptions) -> MenuOptions {
     options
 }
 
+/// The menu bar icon is the only way back to a pet that is off screen once the Dock tile is gone,
+/// so a hidden pet wins over the `show_taskbar_icon` preference; with the pet on screen the
+/// preference is honoured exactly as written.
+fn tray_visible(pet_hidden: bool, show_taskbar_icon: bool) -> bool {
+    pet_hidden || show_taskbar_icon
+}
+
+/// Applies `tray_visible` to the tray `setup` built. The status item is created once and never
+/// destroyed, so every later change is a visibility flip and a hidden icon can come straight back.
+fn apply_tray_visibility(app: &AppHandle, options: &MenuOptions) -> Result<(), String> {
+    let state = match app.try_state::<MenuState>() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let visible = tray_visible(
+        !options.pet_dock_visible,
+        !crate::windows::taskbar_icon_hidden(app),
+    );
+    state.tray.set_visible(visible).map_err(|e| e.to_string())
+}
+
+/// Re-derives the menu bar icon from the state already held. The commands that change the
+/// `show_taskbar_icon` preference carry no menu options, so they call this instead of `sync`.
+pub fn sync_tray_visibility(app: &AppHandle) -> Result<(), String> {
+    let options = match app.try_state::<MenuState>() {
+        Some(state) => match state.options.lock() {
+            Ok(options) => options.clone(),
+            Err(_) => return Err("native menu state poisoned".into()),
+        },
+        None => return Ok(()),
+    };
+    apply_tray_visibility(app, &options)
+}
+
 fn rebuild(app: &AppHandle, options: MenuOptions) -> Result<(), String> {
     let state = app
         .try_state::<MenuState>()
@@ -346,6 +380,7 @@ fn rebuild(app: &AppHandle, options: MenuOptions) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     app.set_menu(application_menu(app, &options).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    apply_tray_visibility(app, &options)?;
     *state
         .context
         .lock()
@@ -394,6 +429,10 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
         options: Mutex::new(options),
     }) {
         return Err("native menu already initialized".into());
+    }
+    // A visibility flip is never worth a failed start: the tray is already on screen here.
+    if let Err(error) = sync_tray_visibility(app) {
+        eprintln!("Could not apply the menu bar icon visibility: {error}");
     }
     app.on_menu_event(|app, event| {
         let id = event.id().as_ref();
@@ -444,6 +483,7 @@ pub fn sync(app: &AppHandle, args: &Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     app.set_menu(application_menu(app, &options).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    apply_tray_visibility(app, &options)?;
     *state
         .context
         .lock()
@@ -519,6 +559,16 @@ mod tests {
         assert!(!MenuOptions::from_args(&json!({}))
             .unwrap()
             .float_over_fullscreen);
+    }
+
+    #[test]
+    fn a_hidden_pet_keeps_the_menu_bar_icon_whatever_the_preference_says() {
+        // Pet hidden: the tray is the only entry left, so it is forced on either way.
+        assert!(tray_visible(true, true));
+        assert!(tray_visible(true, false));
+        // Pet on screen: the preference decides, and `show_taskbar_icon=true` still shows it.
+        assert!(tray_visible(false, true));
+        assert!(!tray_visible(false, false));
     }
 
     #[test]

@@ -261,7 +261,7 @@ const CHEST_COUNTDOWN = /([$\w]+)\.value=([$\w]+)===null\?([$\w]+)\(([$\w]+)\.us
 export const MAC_CHEST_FALLBACK_MARK = 'WUWA_MAC_CHEST_FALLBACK';
 
 export function macChestFallbackHelper(clock = 'co') {
-  return `/* ${MAC_CHEST_FALLBACK_MARK}: activity_config_load_failed leaves the treasure chest timestamps at 0, so the stock projection collapses to 0 and the bubble renders without a countdown. A server deadline greater than 0 is recorded per side with its observation time; while the server sends nothing usable the last recorded deadline is reused for at most 90 minutes, then dropped. localStorage wuwa.chestFallback=off restores the stock projection and leaves the record alone. Only the two computed countdown values are routed here: the formatters, the progress ratio and the ring are untouched. Delete this block and the two __wuwatappoChestRemaining call sites to restore stock behaviour. */
+  return `/* ${MAC_CHEST_FALLBACK_MARK}: activity_config_load_failed leaves the treasure chest timestamps at 0, so the stock projection collapses to 0 and the bubble renders without a countdown. A server deadline greater than 0 is recorded per side with its observation time; while the server sends nothing usable the last recorded deadline is reused for at most 90 minutes, then dropped. Only the two computed countdown values are routed here: the formatters, the progress ratio and the ring are untouched. Each of the two call sites takes the later of this projection and the local anchor a successful open writes, so a server deadline still in the future keeps the gate closed and an anchor that outlasts the server cannot reopen the bubble early; the anchor only raises the value, never lowers it. localStorage wuwa.chestFallback=off restores the stock projection verbatim (the anchor decides alone, as before) and leaves the record alone. Delete this block and the two merged call sites to restore stock behaviour. */
 const __wuwatappoChestCache={left:{deadline:0,stamp:0},right:{deadline:0,stamp:0}};
 const __wuwatappoChestMaxAge=54e5;
 function __wuwatappoChestKey(side){return"wuwa.chestDeadline."+side}
@@ -301,7 +301,12 @@ export function patchMacChestCountdownFallback(source) {
   if (!source.includes(`function ${clock}(e,t=is()){const o=No(e);return o<=0?0:Math.max(0,o-t)}`)) {
     throw new Error('Original treasure chest countdown clock changed; reconcile the Mac chest countdown fallback before building.');
   }
-  const patched = source.replace(CHEST_COUNTDOWN, (_, target, offset, helper, store, field, now, stamp) => `${target}.value=${offset}===null?__wuwatappoChestRemaining("${field === 'left_treasure_chest' ? 'left' : 'right'}",${store}.userInfo?.${field},${now}):Math.max(0,${offset}-${stamp})`);
+  // Both sources that can hold the gate closed are merged here and nowhere else: the server
+  // projection (with its recorded 90 minute fallback) and the local anchor a successful open
+  // writes. Taking the later one keeps a live server deadline authoritative and stops an anchor
+  // that outlasts the server from reopening the bubble early. `wuwa.chestFallback=off` keeps the
+  // stock projection verbatim, anchor first.
+  const patched = source.replace(CHEST_COUNTDOWN, (_, target, offset, helper, store, field, now, stamp) => `${target}.value=__wuwatappoChestDisabled()?${offset}===null?${helper}(${store}.userInfo?.${field},${now}):Math.max(0,${offset}-${stamp}):Math.max(__wuwatappoChestRemaining("${field === 'left_treasure_chest' ? 'left' : 'right'}",${store}.userInfo?.${field},${now}),${offset}===null?0:Math.max(0,${offset}-${stamp}))`);
   return `${macChestFallbackHelper(clock)}${patched}`;
 }
 

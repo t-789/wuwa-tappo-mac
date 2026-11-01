@@ -7,8 +7,11 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 use tauri::{AppHandle, Emitter, Manager};
+
+use crate::input_merge::{MergePoint, MouseMerge};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InputStatus {
@@ -663,12 +666,17 @@ fn route_event(
     }
 }
 
+/// Cursor-driven reactions are rendered by the main webview only; the auxiliary
+/// windows load the same bundle but never subscribe to movement.
+const MOUSE_EVENT_WINDOW: &str = "main";
+
 fn dispatch_events(
     app: AppHandle,
     state: Arc<MonitorState>,
     receiver: mpsc::Receiver<NativeInput>,
 ) {
     let mut routing = MouseRouting::default();
+    let mut merge = MouseMerge::from_env();
     for event in receiver {
         let event = match route_event(event, &mut routing, &state) {
             Ok(Some(event)) => event,
@@ -679,14 +687,19 @@ fn dispatch_events(
                 break;
             }
         };
+        if !should_forward(&mut merge, &event, Instant::now()) {
+            continue;
+        }
         let result = match event {
             RoutedInput::Key { key, pressed } => {
                 app.emit(if pressed { "key-press" } else { "key-release" }, key)
             }
-            RoutedInput::Move(position) => app.emit("mouse-move", position),
+            RoutedInput::Move(position) => {
+                app.emit_to(MOUSE_EVENT_WINDOW, "mouse-move", position)
+            }
             RoutedInput::Button { position, button } => {
                 // Keep global cursor state current before the main-owned button event.
-                app.emit("mouse-move", position)
+                app.emit_to(MOUSE_EVENT_WINDOW, "mouse-move", position)
                     .and_then(|_| app.emit("mouse-button", button))
             }
         };
@@ -695,6 +708,21 @@ fn dispatch_events(
             state.wake_and_stop();
             break;
         }
+    }
+}
+
+/// Movement may coalesce; every discrete event passes untouched so clicks and drag
+/// keep their exact order and timing.
+fn should_forward(merge: &mut MouseMerge, event: &RoutedInput, now: Instant) -> bool {
+    match event {
+        RoutedInput::Move(position) => merge.accept(
+            MergePoint {
+                x: position.x,
+                y: position.y,
+            },
+            now,
+        ),
+        RoutedInput::Key { .. } | RoutedInput::Button { .. } => true,
     }
 }
 
@@ -1318,5 +1346,48 @@ mod tests {
             error: Some("input_monitoring_permission_required".into()),
         };
         assert_eq!(serde_json::to_value(status).unwrap()["granted"], false);
+    }
+
+    fn routed_move(x: f64, y: f64) -> RoutedInput {
+        RoutedInput::Move(MousePosition {
+            x,
+            y,
+            member_id: None,
+        })
+    }
+
+    #[test]
+    fn discrete_events_bypass_the_mouse_merge() {
+        let mut merge = MouseMerge::from_spec(Some("30"));
+        let start = Instant::now();
+        assert!(should_forward(&mut merge, &routed_move(1.0, 1.0), start));
+        assert!(!should_forward(&mut merge, &routed_move(2.0, 2.0), start));
+
+        let key = RoutedInput::Key {
+            key: "a".into(),
+            pressed: true,
+        };
+        let button = RoutedInput::Button {
+            position: MousePosition {
+                x: 2.0,
+                y: 2.0,
+                member_id: None,
+            },
+            button: MouseButton {
+                button: "left",
+                action: "press",
+                member_id: None,
+            },
+        };
+        // A press, the releases and the keys of a drag all survive a burst of movement.
+        for _ in 0..3 {
+            assert!(should_forward(&mut merge, &key, start));
+            assert!(should_forward(&mut merge, &button, start));
+        }
+
+        // Movement is still coalesced right after the discrete burst.
+        assert!(!should_forward(&mut merge, &routed_move(3.0, 3.0), start));
+        let later = start + std::time::Duration::from_millis(40);
+        assert!(should_forward(&mut merge, &routed_move(3.0, 3.0), later));
     }
 }

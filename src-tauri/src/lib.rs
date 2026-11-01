@@ -2,6 +2,7 @@ mod auth;
 mod geometry;
 mod http;
 mod input;
+mod input_merge;
 mod menu;
 mod overlay;
 mod profile;
