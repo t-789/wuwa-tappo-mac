@@ -19,20 +19,22 @@ const rewritten = projection
     '__wuwatappoChestDisabled()?kr===null?co(R.userInfo?.left_treasure_chest,e):Math.max(0,kr-t):Math.max(__wuwatappoChestRemaining("left",R.userInfo?.left_treasure_chest,e),kr===null?0:Math.max(0,kr-t))')
   .replace('Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t)',
     '__wuwatappoChestDisabled()?Cr===null?co(R.userInfo?.right_treasure_chest,e):Math.max(0,Cr-t):Math.max(__wuwatappoChestRemaining("right",R.userInfo?.right_treasure_chest,e),Cr===null?0:Math.max(0,Cr-t))');
-const helper = macChestFallbackHelper('co');
+const helper = macChestFallbackHelper();
 
-// Mirrors the shipped No()/co() pair the injected helper calls, so the branches under test are the
-// fallback bookkeeping only.
+// The shipped No()/co() pair, kept only as the reference the inlined arithmetic is checked against.
 const stockClock = (value, now) => {
   const deadline = value == null ? 0 : Math.floor(Number(value));
   return !Number.isFinite(deadline) || deadline <= 0 ? 0 : Math.max(0, deadline - now);
 };
 
+// The injected block is prepended to the module, not to the component setup scope, so the only
+// bindings it may see are its own declarations, the standard library and localStorage. No
+// setup-scope stand-in is bound here any more: a helper that reaches for `co` now fails exactly
+// the way it fails inside the shipped bundle.
 function harness({ storage = {} } = {}) {
   const entries = new Map(Object.entries(storage));
   const wall = { value: 1_700_000_000_000 };
   const context = {
-    co: stockClock,
     localStorage: {
       getItem: key => (entries.has(key) ? entries.get(key) : null),
       setItem: (key, value) => entries.set(key, String(value)),
@@ -42,7 +44,13 @@ function harness({ storage = {} } = {}) {
   };
   vm.createContext(context);
   vm.runInContext(helper, context);
-  return { entries, wall, remaining: (side, raw, now) => context.__wuwatappoChestRemaining(side, raw, now) };
+  return {
+    entries,
+    wall,
+    context,
+    remaining: (side, raw, now) => context.__wuwatappoChestRemaining(side, raw, now),
+    read: expression => vm.runInContext(expression, context),
+  };
 }
 
 test('both chest projections route through the fallback helper and nothing else moves', () => {
@@ -231,4 +239,136 @@ test('wuwa.chestFallback=off keeps the stock projection verbatim, anchor first',
   assert.equal(h.Nt.value, 5_000_000);
   assert.equal(h.entries.has('wuwa.chestDeadline.left'), false);
 });
+
+// The injected block is prepended to the module, so it cannot name a component-setup symbol: co()
+// and its No()/is() pair live inside the room component, and a top-level call to them threw
+// ReferenceError on every tick, before the two projections were assigned. These tests pin the
+// block's scope chain, not only its arithmetic.
+
+const STANDARD_GLOBALS = new Set([
+  'globalThis', 'Math', 'Number', 'Date', 'JSON', 'localStorage', 'String', 'Array', 'Object',
+  'Boolean', 'isFinite', 'isNaN', 'parseInt', 'parseFloat', 'undefined', 'NaN', 'Infinity',
+  'console', 'Error', 'Map', 'Set', 'Promise', 'Symbol', 'RegExp', 'structuredClone',
+]);
+
+const PATTERN_NODES = new Set(['ObjectPattern', 'ArrayPattern', 'AssignmentPattern', 'RestElement']);
+
+// Every name the block reads from outside itself plus every name it declares. Declarations are
+// collected flat because this block declares no shadowing names; a destructuring binding would
+// make the flat set unsound, so the audit throws instead of guessing.
+function scopeAudit(source) {
+  const program = parse(source, { ecmaVersion: 'latest', sourceType: 'module' });
+  const declared = new Set();
+  const free = new Set();
+  const visit = (node, parent, key) => {
+    if (PATTERN_NODES.has(node.type)) throw new Error('scope audit does not model ' + node.type);
+    if (node.type !== 'Identifier') return;
+    const func = parent && (parent.type === 'FunctionDeclaration' || parent.type === 'FunctionExpression' || parent.type === 'ArrowFunctionExpression');
+    const declaration = func ? key === 'id' || key === 'params'
+      : parent && parent.type === 'VariableDeclarator' ? key === 'id'
+      : parent && parent.type === 'CatchClause' ? key === 'param'
+      : false;
+    if (declaration) { declared.add(node.name); return; }
+    const property = parent && ((parent.type === 'MemberExpression' && key === 'property' && !parent.computed) || (parent.type === 'Property' && key === 'key' && !parent.computed));
+    if (property) return;
+    free.add(node.name);
+  };
+  const walk = (node, parent, key) => {
+    visit(node, parent, key);
+    for (const name of Object.keys(node)) {
+      if (name === 'type' || name === 'start' || name === 'end' || name === 'loc' || name === 'range') continue;
+      const value = node[name];
+      for (const child of Array.isArray(value) ? value : [value]) {
+        if (child && typeof child === 'object' && typeof child.type === 'string') walk(child, node, name);
+      }
+    }
+  };
+  walk(program, null, null);
+  return { declared, free };
+}
+
+function externalNames(source) {
+  const { declared, free } = scopeAudit(source);
+  return [...free].filter(name => !declared.has(name)).sort();
+}
+
+test('the injected helper names nothing outside its own block and the standard library', () => {
+  assert.equal(helper.includes('co('), false);
+  assert.equal(helper.includes('No('), false);
+  assert.equal(helper.includes('is()'), false);
+  const external = externalNames(helper);
+  assert.deepEqual(external, ['Date', 'JSON', 'Math', 'Number', 'localStorage']);
+  for (const banned of ['co', 'is', 'No']) assert.equal(external.includes(banned), false, banned);
+  const { declared } = scopeAudit(helper);
+  assert.equal(declared.has('__wuwatappoChestRemainingMs'), true);
+});
+
+test('a context with no setup-scope clock still projects a live deadline', () => {
+  const h = harness();
+  // The old helper called co() here. A module top-level block has no such binding, so that call
+  // threw ReferenceError before Nt/Ht were assigned; the same call still throws in this context.
+  assert.equal(Reflect.has(h.context, 'co'), false);
+  vm.runInContext('function __legacyClockProjection(raw,now){return co(raw,now)}', h.context);
+  assert.throws(() => vm.runInContext('__legacyClockProjection(5000000,1000000)', h.context), /co is not defined/);
+  assert.equal(h.remaining('left', 5_000_000, 1_000_000) > 0, true);
+  assert.equal(h.remaining('left', 5_000_000, 1_000_000), 4_000_000);
+});
+
+test('the inlined arithmetic matches the stock No()/co() pair on every value the call sites pass', () => {
+  const h = harness();
+  const probe = (raw, now) => h.read('__wuwatappoChestRemainingMs(' + JSON.stringify(raw === undefined ? null : raw) + ',' + now + ')');
+  for (const raw of [5_000_000, 1_700_000_000_000, 1_000, 1, 0, -1, null, undefined, NaN, 'abc', '5000']) {
+    for (const now of [0, 1_000, 1_700_000_000_000]) {
+      assert.equal(probe(raw, now), stockClock(raw, now), String(raw) + ' at ' + now);
+    }
+  }
+});
+
+test('a zero, null or past deadline projects nothing and clears the cached record', () => {
+  const h = harness();
+  h.remaining('left', 5_000_000, 1_000_000);
+  assert.equal(h.read('__wuwatappoChestCache.left.deadline'), 5_000_000);
+  assert.equal(h.read('__wuwatappoChestCache.left.stamp'), h.wall.value);
+  // The recorded deadline is already behind the clock of this call, so nothing is left to reuse.
+  assert.equal(h.remaining('left', 0, 9_000_000), 0);
+  assert.equal(h.read('__wuwatappoChestCache.left.deadline'), 0);
+  assert.equal(h.read('__wuwatappoChestCache.left.stamp'), 0);
+  assert.equal(h.entries.has('wuwa.chestDeadline.left'), false);
+  assert.equal(h.remaining('left', null, 1_000), 0);
+  assert.equal(h.read('__wuwatappoChestCache.left.deadline'), 0);
+  assert.equal(h.remaining('left', undefined, 1_000), 0);
+  assert.equal(h.read('__wuwatappoChestCache.left.deadline'), 0);
+  assert.equal(h.remaining('right', 0, 1_000), 0);
+  assert.equal(h.entries.has('wuwa.chestDeadline.right'), false);
+});
+
+test('the 90 minute record cap covers the whole window and nothing past it', () => {
+  const h = harness();
+  h.remaining('left', 9_000_000, 1_000_000);
+  h.wall.value += 90 * 60 * 1000;
+  assert.equal(h.remaining('left', null, 4_000_000), 5_000_000);
+  h.wall.value += 1;
+  assert.equal(h.remaining('left', null, 4_000_000), 0);
+  assert.equal(h.entries.has('wuwa.chestDeadline.left'), false);
+});
+
+test('every function of the injected block is a direct child of the module program', () => {
+  const matches = sourceFiles()
+    .map(name => ({ name, source: readFileSync(path.join(assetDirectory, name), 'utf8') }))
+    .filter(({ source }) => /===null\?[$\w]+\([$\w]+\.userInfo\?\.left_treasure_chest,/.test(source));
+  assert.equal(matches.length, 1);
+  const [{ name, source }] = matches;
+  const program = parse(patchMacChestCountdownFallback(source), { ecmaVersion: 'latest', sourceType: 'module' });
+  const block = program.body.filter(node => node.type === 'FunctionDeclaration' && node.id.name.startsWith('__wuwatappoChest'));
+  assert.deepEqual(block.map(node => node.id.name), [
+    '__wuwatappoChestKey',
+    '__wuwatappoChestDisabled',
+    '__wuwatappoChestLoad',
+    '__wuwatappoChestDrop',
+    '__wuwatappoChestRemainingMs',
+    '__wuwatappoChestRemaining',
+  ], name);
+  assert.equal(program.body.filter(n => n.type === 'FunctionDeclaration' && n.id.name === '__wuwatappoChestRemaining').length, 1, name);
+});
+
 

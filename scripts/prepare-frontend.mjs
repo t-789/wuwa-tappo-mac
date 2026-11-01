@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { getRegionProfile } from './regions.mjs';
-import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost, patchMacHideShortcutSettings, patchMacThrottleAnimation, patchMacChestCountdownFallback, patchMacChestClickDiagnostics, patchMacChestStateDiagnostics, patchMacChestReadyFix, patchMacChestXoGuard, patchMacNativeHttpAdapter } from './patch-frontend.mjs';
+import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost, patchMacHideShortcutSettings, patchMacThrottleAnimation, patchMacChestCountdownFallback, patchMacChestClickDiagnostics, patchMacChestStateDiagnostics, patchMacChestVnBeat, patchMacChestReadyFix, patchMacChestXoGuard, patchMacNativeHttpAdapter } from './patch-frontend.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const profile = getRegionProfile();
@@ -37,6 +37,8 @@ patchOne('pet animation frame loop', (_, content) => /Math\.min\(\([$\w]+-[$\w]+
 // rewrites those two statements.
 patchOne('treasure chest click diagnostics', (_, content) => content.includes('[chest] openChest failed'), patchMacChestClickDiagnostics);
 patchOne('treasure chest countdown projection', (_, content) => /===null\?[$\w]+\([$\w]+\.userInfo\?\.left_treasure_chest,/.test(content), patchMacChestCountdownFallback);
+// The beat is applied before the snapshot block that reads it, so one build always carries both.
+patchOne('treasure chest tick', (_, content) => /function [$\w]+\(\)\{if\(![$\w]+\.isLoggedIn\)\{[$\w]+\.value=0,[$\w]+\.value=0,[$\w]+\.value=0,[$\w]+\.value=0;return\}/.test(content), patchMacChestVnBeat);
 patchOne('treasure chest state diagnostics', (_, content) => content.includes('left_treasure_chest'), patchMacChestStateDiagnostics);
 patchOne('treasure chest login watcher', (_, content) => /Oe\(\(\)=>[$\w]+\.isLoggedIn,[$\w]+=>\{[$\w]+\.value=!1,/.test(content), patchMacChestReadyFix);
 patchOne('treasure chest in-flight refresher', (_, content) => /let [$\w]+=null,[$\w]+=!1,[$\w]+=!1;async function [$\w]+\([$\w]+\)\{/.test(content), patchMacChestXoGuard);

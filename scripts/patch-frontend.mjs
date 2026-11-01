@@ -260,8 +260,8 @@ const CHEST_COUNTDOWN = /([$\w]+)\.value=([$\w]+)===null\?([$\w]+)\(([$\w]+)\.us
 
 export const MAC_CHEST_FALLBACK_MARK = 'WUWA_MAC_CHEST_FALLBACK';
 
-export function macChestFallbackHelper(clock = 'co') {
-  return `/* ${MAC_CHEST_FALLBACK_MARK}: activity_config_load_failed leaves the treasure chest timestamps at 0, so the stock projection collapses to 0 and the bubble renders without a countdown. A server deadline greater than 0 is recorded per side with its observation time; while the server sends nothing usable the last recorded deadline is reused for at most 90 minutes, then dropped. Only the two computed countdown values are routed here: the formatters, the progress ratio and the ring are untouched. Each of the two call sites takes the later of this projection and the local anchor a successful open writes, so a server deadline still in the future keeps the gate closed and an anchor that outlasts the server cannot reopen the bubble early; the anchor only raises the value, never lowers it. localStorage wuwa.chestFallback=off restores the stock projection verbatim (the anchor decides alone, as before) and leaves the record alone. Delete this block and the two merged call sites to restore stock behaviour. */
+export function macChestFallbackHelper() {
+  return `/* ${MAC_CHEST_FALLBACK_MARK}: activity_config_load_failed leaves the treasure chest timestamps at 0, so the stock projection collapses to 0 and the bubble renders without a countdown. A server deadline greater than 0 is recorded per side with its observation time; while the server sends nothing usable the last recorded deadline is reused for at most 90 minutes, then dropped. Only the two computed countdown values are routed here: the formatters, the progress ratio and the ring are untouched. Each of the two call sites takes the later of this projection and the local anchor a successful open writes, so a server deadline still in the future keeps the gate closed and an anchor that outlasts the server cannot reopen the bubble early; the anchor only raises the value, never lowers it. localStorage wuwa.chestFallback=off restores the stock projection verbatim (the anchor decides alone, as before) and leaves the record alone. This block is prepended at module top level, outside the component setup scope, so everything it touches is globalThis, localStorage, the standard library or its own declarations: the countdown arithmetic is inlined in __wuwatappoChestRemainingMs with the exact semantics of the stock co/No pair (floor the deadline, a non-finite or non-positive deadline counts as 0, otherwise the remaining milliseconds) instead of reaching for a setup-scope helper that is not on this scope chain. Delete this block and the two merged call sites to restore stock behaviour. */
 const __wuwatappoChestCache={left:{deadline:0,stamp:0},right:{deadline:0,stamp:0}};
 const __wuwatappoChestMaxAge=54e5;
 function __wuwatappoChestKey(side){return"wuwa.chestDeadline."+side}
@@ -273,16 +273,17 @@ function __wuwatappoChestDrop(side){
 __wuwatappoChestCache[side].deadline=0;__wuwatappoChestCache[side].stamp=0;
 try{localStorage.removeItem(__wuwatappoChestKey(side))}catch{}
 }
+function __wuwatappoChestRemainingMs(value,now){const n=Math.floor(Number(value));return!Number.isFinite(n)||n<=0?0:Math.max(0,n-now)}
 function __wuwatappoChestRemaining(side,raw,now){
 const value=raw==null?0:Number(raw);
-if(__wuwatappoChestDisabled())return ${clock}(raw,now);
+if(__wuwatappoChestDisabled())return __wuwatappoChestRemainingMs(raw,now);
 if(Number.isFinite(value)&&value>0){
 const deadline=Math.floor(value),cache=__wuwatappoChestCache[side],stamp=Date.now();
 if(cache.deadline!==deadline||stamp-cache.stamp>3e5){cache.deadline=deadline;cache.stamp=stamp;try{localStorage.setItem(__wuwatappoChestKey(side),JSON.stringify({deadline,stamp}))}catch{}}
-return ${clock}(raw,now)
+return __wuwatappoChestRemainingMs(raw,now)
 }
 const last=__wuwatappoChestLoad(side);
-if(last&&last.deadline>now&&Date.now()-last.stamp<=__wuwatappoChestMaxAge)return ${clock}(last.deadline,now);
+if(last&&last.deadline>now&&Date.now()-last.stamp<=__wuwatappoChestMaxAge)return __wuwatappoChestRemainingMs(last.deadline,now);
 __wuwatappoChestDrop(side);
 return 0
 }
@@ -307,7 +308,7 @@ export function patchMacChestCountdownFallback(source) {
   // that outlasts the server from reopening the bubble early. `wuwa.chestFallback=off` keeps the
   // stock projection verbatim, anchor first.
   const patched = source.replace(CHEST_COUNTDOWN, (_, target, offset, helper, store, field, now, stamp) => `${target}.value=__wuwatappoChestDisabled()?${offset}===null?${helper}(${store}.userInfo?.${field},${now}):Math.max(0,${offset}-${stamp}):Math.max(__wuwatappoChestRemaining("${field === 'left_treasure_chest' ? 'left' : 'right'}",${store}.userInfo?.${field},${now}),${offset}===null?0:Math.max(0,${offset}-${stamp}))`);
-  return `${macChestFallbackHelper(clock)}${patched}`;
+  return `${macChestFallbackHelper()}${patched}`;
 }
 
 const CHEST_VISIBILITY_GATES = /const ([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|!([$\w]+)\.isLoggedIn\?!0:([$\w]+)\.value<=0\),([$\w]+)=pe\(\(\)=>\2\.value\|\|!\3\.isLoggedIn\?!0:([$\w]+)\.value<=0\)/g;
@@ -318,16 +319,60 @@ const CHEST_RENDER_GATE = /function ([$\w]+)\(\)\{return ([$\w]+)\.value\|\|([$\
 
 const CHEST_BUSY_GATE = /const ([$\w]+)=W\(!1\),([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|([$\w]+)\.value\|\|([$\w]+)\.isLoggedIn&&!\1\.value\)/g;
 
+const CHEST_CLAIM_ANCHOR = /function ([$\w]+)\(([$\w]+)\)\{const ([$\w]+)=performance\.now\(\)\+([$\w]+);\2==="left"\?\(([$\w]+)=\3,([$\w]+)\.value=\4,([$\w]+)\.value=\4\):\(([$\w]+)=\3,([$\w]+)\.value=\4,([$\w]+)\.value=\4\)\}/g;
+
+const CHEST_CLOCK_SOURCE = /function ([$\w]+)\(([$\w]+),([$\w]+)=([$\w]+)\(\)\)\{const ([$\w]+)=([$\w]+)\(\2\);return \5<=0\?0:Math\.max\(0,\5-\3\)\}/g;
+
+const CHEST_TICK_ANCHOR = /function ([$\w]+)\(\)\{if\(!([$\w]+)\.isLoggedIn\)\{([$\w]+)\.value=0,([$\w]+)\.value=0,([$\w]+)\.value=0,([$\w]+)\.value=0;return\}if\(!([$\w]+)\.value\)return;const ([$\w]+)=([$\w]+)\(\),([$\w]+)=performance\.now\(\);/g;
+
+export const MAC_CHEST_VN_BEAT_MARK = 'WUWA_MAC_CHEST_VN_BEAT';
+
+export function macChestVnBeatHelper() {
+  return `/* ${MAC_CHEST_VN_BEAT_MARK}: the chest tick below is the only writer of the two projected countdowns, and nothing in the UI shows whether it ran at all: a bubble that stays grey while the server still reports a cooldown looks the same whether the tick is never called or is called and returns before it assigns. This block answers that one question and nothing else. One bare call is prepended to the tick body, so every call counts, including the two early returns (session gone, ready gate still false), which is exactly the path a frozen countdown hides in. The helper only increments a counter and stamps Date.now(); it reads no ref, writes no ref, awaits nothing and wraps nothing, so the stock body after the call runs byte for byte as it shipped and a throwing stock path still throws. The state is published at globalThis.__wuwatappoChestVn so the chest diagnostics snapshot can read it without a scope of its own: calls is the lifetime call count of that global, at the wall clock of the last call and null until the first, and the object is absent when this block is not built, which the snapshot records as null. Delete this block and the single call site to restore stock behaviour. */
+globalThis.__wuwatappoChestVn=globalThis.__wuwatappoChestVn||{calls:0,at:null};
+function __wuwatappoChestVnBeat(){const state=globalThis.__wuwatappoChestVn;state.at=Date.now(),state.calls++}
+`;
+}
+
+export function patchMacChestVnBeat(source) {
+  if (source.includes(MAC_CHEST_VN_BEAT_MARK)) throw new Error('Mac chest tick beat is already applied; reconcile the patch order before building.');
+  const gates = [...source.matchAll(CHEST_VISIBILITY_GATES)];
+  if (gates.length !== 1) throw new Error(`Original treasure chest visibility gates changed; found ${gates.length} of 1, reconcile the Mac chest tick beat before building.`);
+  const [, , , user, left, , right] = gates[0];
+  // The tick is named by the two countdowns it zeroes on the logged out branch, so a renamed or
+  // reordered tick is rejected here instead of being recognised by a minified identifier.
+  const ticks = [...source.matchAll(CHEST_TICK_ANCHOR)];
+  const tick = ticks.length === 1 ? ticks[0] : null;
+  if (!tick || tick[2] !== user || tick[3] !== left || tick[4] !== right) {
+    throw new Error(`Original treasure chest tick changed; found ${ticks.length} of 1 zeroing the two countdowns of the same store, reconcile the Mac chest tick beat before building.`);
+  }
+  const head = `function ${tick[1]}(){`;
+  return `${source.slice(0, tick.index)}${macChestVnBeatHelper()}${head}__wuwatappoChestVnBeat();${source.slice(tick.index + head.length)}`;
+}
+
 export const MAC_CHEST_DIAGNOSTICS_MARK = 'WUWA_MAC_CHEST_DIAGNOSTICS';
 
+// 本轮排障临时恢复默认开启，定位后改回 opt-in。
 export function macChestDiagnosticsHelper(vars) {
   const roles = Object.entries(vars).map(([role, name]) => `${role}:"${name}"`).join(",");
   return `/* ${MAC_CHEST_DIAGNOSTICS_MARK}: diagnostic build only. Every 5 seconds, while the document is visible, the treasure chest gate state is copied to localStorage wuwa.chestDbg so the "two grey chests, not clickable" report can be diagnosed offline. This block only reads the existing refs and computed gates: no ref is written here, no request is issued and no rendering changes. It is off by default: the switch is read once as this module evaluates, and unless localStorage wuwa.chestDbg holds exactly "on" or "1" this block writes nothing at all, so a shipped install keeps whatever storage the stock build left (the app window has no devtools, which is why an opt-in beat a kill switch). Arming it (write "on" into that key from a devtools console, then reload) starts the five second snapshots for that page load; the snapshot then owns the key, so the following reload reads a JSON value, which is not "on", and the block goes quiet again. Deleting this block together with the anchor it sits behind restores stock behaviour. qt is the computed kt that disables both reward buttons, fn the forced-refresh flag, and mi/br/qn the three refs kt is built from (mount-in-progress, login-in-progress, chest-ready), so a grey-button capture can be read without guessing which term stayed set. The minified identifiers a snapshot was read from are recorded inside the snapshot as vars, so an older capture stays readable after a rebuild. xo is the read-only view the chest in-flight guard block below publishes at globalThis.__wuwatappoChestXoProbe: whether the refresher slot is still in flight, how long it has been pending, how many calls ran a body against how many failed, and the last failure reason with its name and code. Its gate field is the network store status read at snapshot time, gateAtCall is the status the last refresher call saw as it entered (the very value the stock gate branch compares one statement later), so a capture can separate a call the gate skipped from a call that issued a request and failed; skips counts the calls whose entry gate was not online or unknown, and onlineAt is the first moment this build observed the store online. It is null when that block is absent, so this snapshot stays readable without it. */
-const __wuwatappoChestDbgOn=(()=>{try{const value=localStorage.getItem("wuwa.chestDbg");return value==="on"||value==="1"}catch{return!1}})();
+/* TEMPORARY diagnostic round: the snapshot is default-on again and only localStorage wuwa.chestDbg==="off" silences it. tick counts the writes, so a capture can tell a live snapshot from a frozen page; fr is the cooldown constant every local anchor is built from; now is the server-adjusted clock the stock projection reads; anchorL/anchorR are the raw local anchors, null until a claim writes one. vn/vnAt are the chest tick beat call count and the wall clock of its last call, so a capture separates a tick that never ran from a tick that ran and returned before it assigned; both are null when that block is not built. wuwa.chestClaim keeps the last three claim paths, which is what separates an anchor that never moves from one that is reset again and again. */
+const __wuwatappoChestDbgOn=(()=>{try{return localStorage.getItem("wuwa.chestDbg")!=="off"}catch{return!0}})();
+let __wuwatappoChestDbgTick=0;
+const __wuwatappoChestClaimKey="wuwa.chestClaim",__wuwatappoChestClaimMax=3;
+function __wuwatappoChestClaim(side){
+try{
+const isLeft=side==="left",list=(()=>{try{const raw=localStorage.getItem(__wuwatappoChestClaimKey);const parsed=raw?JSON.parse(raw):null;return Array.isArray(parsed)?parsed:[]}catch{return[]}})();
+list.push({t:Date.now(),side:typeof side==="string"?side:null,fr:${vars.duration},anchorAfter:isLeft?${vars.anchorLeft}:${vars.anchorRight},remainingAfter:isLeft?${vars.left}.value:${vars.right}.value,raw:isLeft?(${vars.user}.userInfo?.left_treasure_chest??null):(${vars.user}.userInfo?.right_treasure_chest??null)});
+while(list.length>__wuwatappoChestClaimMax)list.shift();
+localStorage.setItem(__wuwatappoChestClaimKey,JSON.stringify(list))
+}catch{}
+}
 const __wuwatappoChestDbgRecord=()=>{
 try{
 if(!__wuwatappoChestDbgOn)return;
-localStorage.setItem("wuwa.chestDbg",JSON.stringify({t:Date.now(),isLoggedIn:!!${vars.user}.isLoggedIn,qt:!!${vars.loading}.value,fn:!!${vars.request}.value,mi:!!${vars.mi}.value,br:!!${vars.br}.value,qn:!!${vars.qn}.value,left:{raw:${vars.user}.userInfo?.left_treasure_chest??null,remaining:${vars.left}.value,show:!!${vars.leftShow}.value},right:{raw:${vars.user}.userInfo?.right_treasure_chest??null,remaining:${vars.right}.value,show:!!${vars.rightShow}.value},clicks:{re:${vars.clicks}.value,need:${vars.need},upper:${vars.upper}},visible:{zr:!!${vars.visibleLeft}.value,jr:!!${vars.visibleRight}.value},xo:typeof globalThis.__wuwatappoChestXoProbe==="function"?globalThis.__wuwatappoChestXoProbe():null,vars:{${roles}}}))
+const __wuwatappoChestVnView=(()=>{try{const state=globalThis.__wuwatappoChestVn;return state&&typeof state==="object"?{calls:Number.isFinite(state.calls)?state.calls:null,at:state.at??null}:{calls:null,at:null}}catch{return{calls:null,at:null}}})();
+localStorage.setItem("wuwa.chestDbg",JSON.stringify({t:Date.now(),tick:++__wuwatappoChestDbgTick,isLoggedIn:!!${vars.user}.isLoggedIn,qt:!!${vars.loading}.value,fn:!!${vars.request}.value,mi:!!${vars.mi}.value,br:!!${vars.br}.value,qn:!!${vars.qn}.value,fr:${vars.duration},now:${vars.clock}(),anchorL:${vars.anchorLeft},anchorR:${vars.anchorRight},vn:__wuwatappoChestVnView.calls,vnAt:__wuwatappoChestVnView.at,left:{raw:${vars.user}.userInfo?.left_treasure_chest??null,remaining:${vars.left}.value,show:!!${vars.leftShow}.value},right:{raw:${vars.user}.userInfo?.right_treasure_chest??null,remaining:${vars.right}.value,show:!!${vars.rightShow}.value},clicks:{re:${vars.clicks}.value,need:${vars.need},upper:${vars.upper}},visible:{zr:!!${vars.visibleLeft}.value,jr:!!${vars.visibleRight}.value},xo:typeof globalThis.__wuwatappoChestXoProbe==="function"?globalThis.__wuwatappoChestXoProbe():null,vars:{${roles}}}))
 }catch{}
 };
 const __wuwatappoChestDbgTimer=setInterval(()=>{
@@ -357,7 +402,20 @@ export function patchMacChestStateDiagnostics(source) {
     throw new Error(`Original treasure chest busy gate changed; found ${busyGates.length} of 1 built from the same loading gate, reconcile the Mac chest state diagnostics before building.`);
   }
   const qn = busy[1], mi = busy[3], busyLogin = busy[4];
-  return source.replace(anchor[0], () => anchor[0] + "\n" + macChestDiagnosticsHelper({ user, loading, request, left, right, leftShow, rightShow, clicks, need, upper, visibleLeft, visibleRight, mi, br: busyLogin, qn }));
+  // The claim path is the only place the local anchor is written; the cross-check against the
+  // countdowns the gates already named keeps a moved or renamed anchor from being recorded by
+  // number. The claim record only reads kr/Cr and the two projected values right after the stock
+  // assignment, and it appends one statement to that function body, nothing else.
+  const claims = [...source.matchAll(CHEST_CLAIM_ANCHOR)];
+  const claim = claims.length === 1 ? claims[0] : null;
+  if (!claim || claim[6] !== left || claim[9] !== right) {
+    throw new Error(`Original treasure chest claim anchor changed; found ${claims.length} of 1 reusing the two countdowns, reconcile the Mac chest state diagnostics before building.`);
+  }
+  const side = claim[2], duration = claim[4], anchorLeft = claim[5], anchorRight = claim[8];
+  const clocks = [...source.matchAll(CHEST_CLOCK_SOURCE)];
+  if (clocks.length !== 1) throw new Error(`Original treasure chest countdown clock changed; found ${clocks.length} of 1, reconcile the Mac chest state diagnostics before building.`);
+  const recorded = source.replace(claim[0], () => `${claim[0].slice(0, -1)};__wuwatappoChestClaim(${side})}`);
+  return recorded.replace(anchor[0], () => anchor[0] + "\n" + macChestDiagnosticsHelper({ user, loading, request, left, right, leftShow, rightShow, clicks, need, upper, visibleLeft, visibleRight, mi, br: busyLogin, qn, duration, anchorLeft, anchorRight, clock: clocks[0][4] }));
 }
 
 
