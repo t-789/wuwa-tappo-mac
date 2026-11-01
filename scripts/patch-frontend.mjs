@@ -303,3 +303,156 @@ export function patchMacChestCountdownFallback(source) {
   return `${macChestFallbackHelper(clock)}${patched}`;
 }
 
+const CHEST_VISIBILITY_GATES = /const ([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|!([$\w]+)\.isLoggedIn\?!0:([$\w]+)\.value<=0\),([$\w]+)=pe\(\(\)=>\2\.value\|\|!\3\.isLoggedIn\?!0:([$\w]+)\.value<=0\)/g;
+
+const CHEST_CLICK_GATES = /,([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|!([$\w]+)\.isLoggedIn\?!0:([$\w]+)\.value>=([$\w]+)\),([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|!([$\w]+)\.isLoggedIn\?!1:([$\w]+)\.value>=([$\w]+)&&([$\w]+)\.value<([$\w]+)\)/g;
+
+const CHEST_RENDER_GATE = /function ([$\w]+)\(\)\{return ([$\w]+)\.value\|\|([$\w]+)\.value\|\|!([$\w]+)\.value\?!1:!!\(([$\w]+)\.value&&([$\w]+)\.value\|\|([$\w]+)\.value&&([$\w]+)\.value\)\}/g;
+
+const CHEST_BUSY_GATE = /const ([$\w]+)=W\(!1\),([$\w]+)=pe\(\(\)=>([$\w]+)\.value\|\|([$\w]+)\.value\|\|([$\w]+)\.isLoggedIn&&!\1\.value\)/g;
+
+export const MAC_CHEST_DIAGNOSTICS_MARK = 'WUWA_MAC_CHEST_DIAGNOSTICS';
+
+export function macChestDiagnosticsHelper(vars) {
+  const roles = Object.entries(vars).map(([role, name]) => `${role}:"${name}"`).join(",");
+  return `/* ${MAC_CHEST_DIAGNOSTICS_MARK}: diagnostic build only. Every 5 seconds, while the document is visible, the treasure chest gate state is copied to localStorage wuwa.chestDbg so the "two grey chests, not clickable" report can be diagnosed offline. This block only reads the existing refs and computed gates: no ref is written here, no request is issued and no rendering changes. While localStorage wuwa.chestDbg holds "off" nothing is written on that tick. Deleting this block together with the anchor it sits behind restores stock behaviour. qt is the computed kt that disables both reward buttons, fn the forced-refresh flag, and mi/br/qn the three refs kt is built from (mount-in-progress, login-in-progress, chest-ready), so a grey-button capture can be read without guessing which term stayed set. The minified identifiers a snapshot was read from are recorded inside the snapshot as vars, so an older capture stays readable after a rebuild. xo is the read-only view the chest in-flight guard block below publishes at globalThis.__wuwatappoChestXoProbe: whether the refresher slot is still in flight, how long it has been pending, how many calls ran a body against how many failed, and the last failure reason with its name and code. Its gate field is the network store status read at snapshot time, gateAtCall is the status the last refresher call saw as it entered (the very value the stock gate branch compares one statement later), so a capture can separate a call the gate skipped from a call that issued a request and failed; skips counts the calls whose entry gate was not online or unknown, and onlineAt is the first moment this build observed the store online. It is null when that block is absent, so this snapshot stays readable without it. */
+const __wuwatappoChestDbgRecord=()=>{
+try{
+if(localStorage.getItem("wuwa.chestDbg")==="off")return;
+localStorage.setItem("wuwa.chestDbg",JSON.stringify({t:Date.now(),isLoggedIn:!!${vars.user}.isLoggedIn,qt:!!${vars.loading}.value,fn:!!${vars.request}.value,mi:!!${vars.mi}.value,br:!!${vars.br}.value,qn:!!${vars.qn}.value,left:{raw:${vars.user}.userInfo?.left_treasure_chest??null,remaining:${vars.left}.value,show:!!${vars.leftShow}.value},right:{raw:${vars.user}.userInfo?.right_treasure_chest??null,remaining:${vars.right}.value,show:!!${vars.rightShow}.value},clicks:{re:${vars.clicks}.value,need:${vars.need},upper:${vars.upper}},visible:{zr:!!${vars.visibleLeft}.value,jr:!!${vars.visibleRight}.value},xo:typeof globalThis.__wuwatappoChestXoProbe==="function"?globalThis.__wuwatappoChestXoProbe():null,vars:{${roles}}}))
+}catch{}
+};
+const __wuwatappoChestDbgTimer=setInterval(()=>{
+try{if(document.hidden)return}catch{}
+__wuwatappoChestDbgRecord()
+},5e3);
+`;
+}
+
+export function patchMacChestStateDiagnostics(source) {
+  if (source.includes(MAC_CHEST_DIAGNOSTICS_MARK)) throw new Error('Mac chest state diagnostics are already applied; reconcile the patch order before building.');
+  const gates = [...source.matchAll(CHEST_VISIBILITY_GATES)];
+  if (gates.length !== 1) throw new Error(`Original treasure chest visibility gates changed; found ${gates.length} of 1, reconcile the Mac chest state diagnostics before building.`);
+  const [, leftShow, loading, user, left, rightShow, right] = gates[0];
+  const clickGates = [...source.matchAll(CHEST_CLICK_GATES)];
+  const click = clickGates.length === 1 ? clickGates[0] : null;
+  const clickConsistent = !!click && [click[2], click[7]].every(name => name === loading) && [click[3], click[8]].every(name => name === user) && [click[9], click[11]].every(name => name === click[4]) && click[10] === click[5];
+  if (!clickConsistent) throw new Error(`Original treasure chest click gates changed; found ${clickGates.length} of 1 consistent with the visibility gates, reconcile the Mac chest state diagnostics before building.`);
+  const clicks = click[4], need = click[5], upper = click[12];
+  const render = [...source.matchAll(CHEST_RENDER_GATE)];
+  const anchor = render.length === 1 ? render[0] : null;
+  if (!anchor || anchor[2] !== loading || anchor[6] !== leftShow || anchor[8] !== rightShow) throw new Error(`Original treasure chest render gate changed; found ${render.length} of 1 reusing the same gates, reconcile the Mac chest state diagnostics before building.`);
+  const request = anchor[3], visibleLeft = anchor[5], visibleRight = anchor[7];
+  const busyGates = [...source.matchAll(CHEST_BUSY_GATE)];
+  const busy = busyGates.length === 1 ? busyGates[0] : null;
+  if (!busy || busy[2] !== loading || busy[5] !== user || !source.includes(`${busy[3]}=W(!0)`) || !source.includes(`${busy[4]}=W(!1)`)) {
+    throw new Error(`Original treasure chest busy gate changed; found ${busyGates.length} of 1 built from the same loading gate, reconcile the Mac chest state diagnostics before building.`);
+  }
+  const qn = busy[1], mi = busy[3], busyLogin = busy[4];
+  return source.replace(anchor[0], () => anchor[0] + "\n" + macChestDiagnosticsHelper({ user, loading, request, left, right, leftShow, rightShow, clicks, need, upper, visibleLeft, visibleRight, mi, br: busyLogin, qn }));
+}
+
+
+const CHEST_LOGIN_WATCHER = /Oe\(\(\)=>([$\w]+)\.isLoggedIn,([$\w]+)=>{([$\w]+)\.value=!1,[$\w]+\+\+,[$\w]+=null,[$\w]+=null,[$\w]+=null,[$\w]+\(\),\2&&([$\w]+)\(\)},\{flush:"sync"\}\)/g;
+
+export const MAC_CHEST_READY_FIX_MARK = 'WUWA_MAC_CHEST_READY_FIX';
+
+export function macChestReadyFixHelper({ user, ready, refresh, status, watch }) {
+  return `/* ${MAC_CHEST_READY_FIX_MARK}: the login watcher right below fires on a login transition only, so a session restored from cookies before mount never runs the chest refresher ${refresh}(): ${ready} stays false, the third term of the button gate stays true, and both reward buttons render disabled until the next login. This block replays that first run on a timer after setup has finished, and it is gate aware rather than blind. A blind replay is not enough on this build: ${refresh}() reaches the refresher, and that refresher issues no request unless the network store is still usable - its stock branch only enters the request when the status reads online or unknown, and every other status logs "activityInfo skipped: network gate" and returns, leaving the ready flag false with nothing left to fire it. During the first seconds of a cold boot the health check still reports offline, reconnecting or degraded, so a replay fired then is skipped in silence: that is the boot race this block closes, and it is why two calls can enter, succeed and still leave ${ready} false. Every attempt therefore reads ${status}.value.status first and asks for a refresh only for the two statuses the stock branch accepts, which is the same predicate the stock status watcher next to the refresher spells out (${watch}(()=>${status}.value.status,...)). Three triggers, each armed only while ${user}.isLoggedIn is true and ${ready}.value is false: one replay deferred to a timer so it lands after setup, one watch on ${status}.value.status that fires the moment the store turns online or unknown with the gate still false, and a low frequency fallback of at most 6 attempts 10 seconds apart, which covers the health check backoff window. The chain stops for good as soon as ${ready} turns true, the session drops or the budget is spent, so a failing boot costs at most 7 refreshes instead of a request storm. The replay is deferred on purpose: ${refresh}() reaches the config refresh synchronously, that refresh reads bindings the setup scope declares further down, and an inline call would hit their temporal dead zone, which the async body of ${refresh} would only surface as a rejected promise with ${ready} still false. The status watch cannot hit that dead zone, because a status change is delivered from the network task, never from the synchronous remainder of setup. While localStorage wuwa.chestReadyFix holds "off" no timer and no watch is installed at all and stock behaviour is restored. Deleting this block restores stock behaviour. */
+(()=>{
+try{if(localStorage.getItem("wuwa.chestReadyFix")==="off")return}catch{}
+const __wuwatappoChestRetryLimit=6,__wuwatappoChestRetryGap=1e4;
+let __wuwatappoChestRetries=0,__wuwatappoChestTimer=null,__wuwatappoChestStopped=!1;
+function __wuwatappoChestArmed(){try{return!!${user}.isLoggedIn&&!${ready}.value}catch{return!1}}
+function __wuwatappoChestOpen(){try{const s=${status}.value.status;return s==="online"||s==="unknown"}catch{return!1}}
+function __wuwatappoChestStop(){__wuwatappoChestStopped=!0;if(__wuwatappoChestTimer===null)return;try{clearTimeout(__wuwatappoChestTimer)}catch{}__wuwatappoChestTimer=null}
+function __wuwatappoChestFire(){if(!__wuwatappoChestArmed())return __wuwatappoChestStop();if(!__wuwatappoChestOpen())return;try{${refresh}()}catch{}}
+function __wuwatappoChestTick(){__wuwatappoChestTimer=null,__wuwatappoChestFire();if(__wuwatappoChestStopped||__wuwatappoChestRetries>=__wuwatappoChestRetryLimit)return;__wuwatappoChestRetries++,__wuwatappoChestTimer=setTimeout(__wuwatappoChestTick,__wuwatappoChestRetryGap)}
+try{${watch}(()=>${status}.value.status,()=>__wuwatappoChestFire(),{flush:"sync"})}catch{}
+__wuwatappoChestTimer=setTimeout(__wuwatappoChestTick,0)
+})();
+`;
+}
+
+function chestXoAnchor(source, label) {
+  const heads = [...source.matchAll(CHEST_XO_HEAD)];
+  if (heads.length !== 1) throw new Error(`Original treasure chest refresher changed; found ${heads.length} of 1, reconcile the Mac ${label} before building.`);
+  const head = heads[0];
+  const gate = CHEST_XO_GATE.exec(source.slice(head.index + head[0].length));
+  if (!gate || gate[1] !== head[5] || gate[3] !== head[3] || gate[4] !== head[1]) throw new Error(`Original treasure chest refresher gate changed; found 0 of 1 consistent with its slot, reconcile the Mac ${label} before building.`);
+  return { head, inflight: head[1], done: head[2], force: head[3], refresh: head[4], options: head[5], status: gate[2] };
+}
+
+export function patchMacChestReadyFix(source) {
+  if (source.includes(MAC_CHEST_READY_FIX_MARK)) throw new Error('Mac chest ready fix is already applied; reconcile the patch order before building.');
+  const watchers = [...source.matchAll(CHEST_LOGIN_WATCHER)];
+  if (watchers.length !== 1) throw new Error(`Original treasure chest login watcher changed; found ${watchers.length} of 1, reconcile the Mac chest ready fix before building.`);
+  const [watcher] = watchers;
+  const watch = watcher[0].slice(0, watcher[0].indexOf('('));
+  const { status } = chestXoAnchor(source, 'chest ready fix');
+  return source.replace(watcher[0], () => "\n" + macChestReadyFixHelper({ user: watcher[1], ready: watcher[3], refresh: watcher[4], status, watch }) + watcher[0]);
+}
+
+const CHEST_XO_HEAD = /let ([$\w]+)=null,([$\w]+)=!1,([$\w]+)=!1;async function ([$\w]+)\(([$\w]+)\)\{/g;
+
+const CHEST_XO_GATE = /^if\(([$\w]+)\?\.force,([$\w]+)\.value\.status,\1\?\.force&&\(([$\w]+)=!0\),([$\w]+)\)return \4;/;
+
+const CHEST_XO_SETTLE = /([$\w]+)=([$\w]+);try\{await \2\}finally\{\1===\2&&\(\1=null\)\}/g;
+
+export const MAC_CHEST_XO_GUARD_MARK = 'WUWA_MAC_CHEST_XO_GUARD';
+
+export function macChestXoGuardHelper({ inflight, done, force, status }) {
+  return `/* ${MAC_CHEST_XO_GUARD_MARK}: the chest refresher slot right below is the one chest gate term no snapshot can see. The refresher keeps a single in-flight promise and every caller awaits it, so a config load that rejects reaches the app only as an unhandled rejection inside a fire-and-forget call: nothing is logged, the ready flag never turns true, and the lookups stay grey for the rest of the session. This block adds observation only and changes no gate. (1) ${inflight} is observed through then(fulfilled, rejected) on the very promise the refresher created: the derived promise is discarded, the original one still rejects into the await of the caller, and the stock error path of the app is untouched, so this cannot swallow a failure it only records it. The reason is kept as a bounded string plus its name and numeric code, which is what separates a timed-out transport (code ETIMEDOUT), a business envelope (code -1 from the unwrapper) and the network gate branch that issues no request at all. (2) A slot that has stayed pending past 20 seconds is treated as stuck and cleared before the next refresh reads it, which is the only case the stock finally cannot cover: that finally clears the slot when the promise settles, and a promise that never settles never reaches it. The slot stays a plain let: this block only assigns null to it, and the stock finally keeps its exact shape. (3) The whole view is published at globalThis.__wuwatappoChestXoProbe for the chest diagnostics snapshot, and while localStorage wuwa.chestReadyFix holds "off" every hook returns before it writes anything, which leaves the stock slot, the stock reset and the absence of any observer exactly as they shipped. (4) Three of those fields exist for the boot race the ready fix block closes: gateAtCall is the network store status read as a call enters, which is the very value the stock gate branch compares one statement later in the same tick, so a capture separates a call the gate skipped from a call that issued a request and failed; skips counts the runs whose entry gate was not online or unknown, the runs that issue no request at all and leave the ready flag false with nothing left to fire it; onlineAt is the first moment this build observed the store online, stamped at any refresher entry or snapshot read and never rewritten. Every access to the network store is wrapped, so a snapshot can never throw into the render path. Deleting this block and the three hooks it installs restores stock behaviour. */
+const __wuwatappoChestXoState=globalThis.__wuwatappoChestXo||(globalThis.__wuwatappoChestXo={calls:0,runs:0,settles:0,failures:0,expired:0,skips:0,error:null,errorName:null,code:null,gate:null,gateAtCall:null,onlineAt:null,force:!1,since:0,promise:null});
+const __wuwatappoChestXoMaxAge=2e4;
+function __wuwatappoChestXoOff(){try{return localStorage.getItem("wuwa.chestReadyFix")==="off"}catch{return!1}}
+function __wuwatappoChestXoOpen(value){return value==="online"||value==="unknown"}
+function __wuwatappoChestXoMark(value){const st=__wuwatappoChestXoState;if(value!=="online"||st.onlineAt!=null)return;st.onlineAt=Date.now()}
+function __wuwatappoChestXoSettle(promise,error){
+const st=__wuwatappoChestXoState;
+if(st.promise!==promise)return;
+st.settles++;
+if(!error)return;
+st.failures++,st.error=String(error&&error.message||error).slice(0,300),st.errorName=error&&error.name?String(error.name).slice(0,80):null,st.code=error&&typeof error.code==="number"?error.code:null;
+}
+function __wuwatappoChestXoStart(promise){
+const st=__wuwatappoChestXoState;
+if(__wuwatappoChestXoOff())return;
+st.runs++,st.promise=promise,st.since=Date.now(),st.error=null,st.errorName=null,st.code=null;
+__wuwatappoChestXoOpen(st.gateAtCall)||st.skips++;
+try{promise.then(()=>__wuwatappoChestXoSettle(promise,null),error=>__wuwatappoChestXoSettle(promise,error))}catch{}
+}
+function __wuwatappoChestXoEnter(options){
+const st=__wuwatappoChestXoState;
+if(__wuwatappoChestXoOff())return;
+st.calls++,st.force=!!options?.force;
+try{st.gateAtCall=${status}.value.status,st.gate=st.gateAtCall}catch{}
+__wuwatappoChestXoMark(st.gateAtCall);
+if(!${inflight}||st.promise!==${inflight}||!st.since||Date.now()-st.since<=__wuwatappoChestXoMaxAge)return;
+${inflight}=null,st.promise=null,st.since=0,st.expired++
+}
+function __wuwatappoChestXoProbe(){
+const st=__wuwatappoChestXoState;
+let gate=null;
+try{gate=${status}.value.status}catch{}
+__wuwatappoChestXoOff()||__wuwatappoChestXoMark(gate);
+return{inflight:!!${inflight},ageMs:${inflight}&&st.since?Date.now()-st.since:0,calls:st.calls,runs:st.runs,settles:st.settles,failures:st.failures,expired:st.expired,skips:st.skips,error:st.error,errorName:st.errorName,code:st.code,gate,gateAtCall:st.gateAtCall,onlineAt:st.onlineAt,force:!!${force},done:!!${done}}
+}
+try{globalThis.__wuwatappoChestXoProbe=__wuwatappoChestXoProbe}catch{}
+`;
+}
+
+export function patchMacChestXoGuard(source) {
+  if (source.includes(MAC_CHEST_XO_GUARD_MARK)) throw new Error('Mac chest in-flight guard is already applied; reconcile the patch order before building.');
+  const { head, inflight, done, force, refresh, options, status } = chestXoAnchor(source, 'chest in-flight guard');
+  const slot = `let ${inflight}=null,${done}=!1,${force}=!1;`;
+  const entry = `async function ${refresh}(${options}){`;
+  const patched = `${source.slice(0, head.index)}${slot}\n${macChestXoGuardHelper({ inflight, done, force, status })}${entry}__wuwatappoChestXoEnter(${options});${source.slice(head.index + head[0].length)}`;
+  const settles = [...patched.matchAll(CHEST_XO_SETTLE)].filter(match => match[1] === inflight);
+  if (settles.length !== 1) throw new Error(`Original treasure chest refresher reset changed; found ${settles.length} of 1 on its own slot, reconcile the Mac chest in-flight guard before building.`);
+  const settle = settles[0];
+  const promise = settle[2];
+  const reset = `${inflight}=${promise};try{await ${promise}}finally{${inflight}===${promise}&&(${inflight}=null)}`;
+  if (settle[0] !== reset) throw new Error('Original treasure chest refresher reset changed; reconcile the Mac chest in-flight guard before building.');
+  return `${patched.slice(0, settle.index)}${inflight}=${promise};__wuwatappoChestXoStart(${promise});try{await ${promise}}finally{${inflight}===${promise}&&(${inflight}=null)}${patched.slice(settle.index + settle[0].length)}`;
+}

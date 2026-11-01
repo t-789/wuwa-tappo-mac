@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { getRegionProfile } from './regions.mjs';
-import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost, patchMacHideShortcutSettings, patchMacThrottleAnimation, patchMacChestCountdownFallback, patchMacNativeHttpAdapter } from './patch-frontend.mjs';
+import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacCountdownPaintPolicy, patchMacCountdownPaintCost, patchMacHideShortcutSettings, patchMacThrottleAnimation, patchMacChestCountdownFallback, patchMacChestStateDiagnostics, patchMacChestReadyFix, patchMacChestXoGuard, patchMacNativeHttpAdapter } from './patch-frontend.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const profile = getRegionProfile();
@@ -34,6 +34,9 @@ patchOne('main layout view', (_, content) => content.includes('[main] window lay
 patchOne('shortcut settings view', (_, content) => content.includes('action:"switchScreen"'), patchMacHideShortcutSettings);
 patchOne('pet animation frame loop', (_, content) => /Math\.min\(\([$\w]+-[$\w]+\)\/1e3,\.028\)/.test(content), patchMacThrottleAnimation);
 patchOne('treasure chest countdown projection', (_, content) => /===null\?[$\w]+\([$\w]+\.userInfo\?\.left_treasure_chest,/.test(content), patchMacChestCountdownFallback);
+patchOne('treasure chest state diagnostics', (_, content) => content.includes('left_treasure_chest'), patchMacChestStateDiagnostics);
+patchOne('treasure chest login watcher', (_, content) => /Oe\(\(\)=>[$\w]+\.isLoggedIn,[$\w]+=>\{[$\w]+\.value=!1,/.test(content), patchMacChestReadyFix);
+patchOne('treasure chest in-flight refresher', (_, content) => /let [$\w]+=null,[$\w]+=!1,[$\w]+=!1;async function [$\w]+\([$\w]+\)\{/.test(content), patchMacChestXoGuard);
 if (profile.region === 'CN') patchOne('domestic SDK loader', (name, content) => name !== entry && content.includes('t.dataset.kuroSdkRetry="true"'), patchDomesticLoginReload);
 patchOne('countdown stylesheet', (name, content) => name.endsWith('.css') && content.includes('.reward-countdown .reward-countdown__bar'), patchMacCountdownPaintCost);
 
