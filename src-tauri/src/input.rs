@@ -4,10 +4,10 @@ use std::{
     ffi::c_void,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -678,6 +678,8 @@ fn dispatch_events(
     let mut routing = MouseRouting::default();
     let mut merge = MouseMerge::from_env();
     for event in receiver {
+        // Marked before routing: an event dropped as a duplicate still proves the user is present.
+        note_input(&event);
         let event = match route_event(event, &mut routing, &state) {
             Ok(Some(event)) => event,
             Ok(None) => continue,
@@ -723,6 +725,131 @@ fn should_forward(merge: &mut MouseMerge, event: &RoutedInput, now: Instant) -> 
             now,
         ),
         RoutedInput::Key { .. } | RoutedInput::Button { .. } => true,
+    }
+}
+
+/// Idle self-heal: the WebKit GPU process only gives the memory it accumulates back when the app
+/// restarts, so a long unattended stretch is ended by a silent restart instead of a prompt. One
+/// process clock backs both marks below; the input path only stores two atomics and the watcher
+/// reads them from its own thread.
+static INPUT_CLOCK: OnceLock<Instant> = OnceLock::new();
+static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+/// Presses minus releases. The tap pairs the two exactly (autorepeat never re-sends a press, and
+/// disabling the tap flushes every held key), so the count returns to zero and can never leave
+/// the restart permanently blocked.
+static HELD_INPUTS: AtomicU64 = AtomicU64::new(0);
+
+const IDLE_RESTART_IDLE_ENV: &str = "WUWA_IDLE_RESTART_IDLE_MIN";
+const IDLE_RESTART_UPTIME_ENV: &str = "WUWA_IDLE_RESTART_MIN_UPTIME_MIN";
+const IDLE_RESTART_DEFAULT_IDLE_MIN: u32 = 5;
+const IDLE_RESTART_DEFAULT_UPTIME_MIN: u32 = 45;
+const IDLE_RESTART_PERIOD: Duration = Duration::from_secs(30);
+
+fn input_clock() -> &'static Instant {
+    INPUT_CLOCK.get_or_init(Instant::now)
+}
+
+/// Every event the tap delivers is input, including a move that coalescing later drops.
+fn note_input(event: &NativeInput) {
+    LAST_INPUT_MS.store(
+        input_clock().elapsed().as_millis() as u64,
+        Ordering::Release,
+    );
+    let pressed = match event {
+        NativeInput::Key { pressed, .. } | NativeInput::Button { pressed, .. } => *pressed,
+        NativeInput::Move(_) => return,
+    };
+    // The dispatch thread is the only writer, so the guarded subtraction cannot underflow.
+    if pressed {
+        HELD_INPUTS.fetch_add(1, Ordering::AcqRel);
+    } else if HELD_INPUTS.load(Ordering::Acquire) != 0 {
+        HELD_INPUTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn minutes(value: u32) -> Duration {
+    Duration::from_secs(u64::from(value) * 60)
+}
+
+/// Both edges count as satisfied, and an idle window of zero is the documented off switch, so it
+/// wins over every other argument.
+fn should_restart(idle: Duration, uptime: Duration, idle_min: u32, min_uptime_min: u32) -> bool {
+    if idle_min == 0 {
+        return false;
+    }
+    uptime >= minutes(min_uptime_min) && idle >= minutes(idle_min)
+}
+
+/// Read once per process: an unparsable value keeps the default rather than a partial reading.
+fn parse_minutes(raw: Option<&str>, fallback: u32) -> u32 {
+    raw.map(str::trim)
+        .and_then(|text| text.parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn env_minutes(name: &str, fallback: u32) -> u32 {
+    parse_minutes(std::env::var(name).ok().as_deref(), fallback)
+}
+
+/// One 30 second loop, started once at setup; no thread is spawned per event and nothing is
+/// created at all while WUWA_IDLE_RESTART_IDLE_MIN is 0.
+pub fn start_idle_watch(app: AppHandle) {
+    let idle_min = env_minutes(IDLE_RESTART_IDLE_ENV, IDLE_RESTART_DEFAULT_IDLE_MIN);
+    if idle_min == 0 {
+        return;
+    }
+    let min_uptime_min = env_minutes(IDLE_RESTART_UPTIME_ENV, IDLE_RESTART_DEFAULT_UPTIME_MIN);
+    let origin = *input_clock();
+    let spawned = thread::Builder::new()
+        .name("wuwatappo-idle-restart".into())
+        .spawn(move || idle_watch(app, origin, idle_min, min_uptime_min));
+    if let Err(error) = spawned {
+        eprintln!("Could not start the idle restart watch: {error}");
+    }
+}
+
+fn idle_watch(app: AppHandle, origin: Instant, idle_min: u32, min_uptime_min: u32) {
+    loop {
+        thread::sleep(IDLE_RESTART_PERIOD);
+        // A stopped tap updates no timestamp, so idle time would be a guess rather than a measurement.
+        if !app
+            .state::<InputMonitor>()
+            .state
+            .running
+            .load(Ordering::Acquire)
+        {
+            continue;
+        }
+        // A press without its release would mean the user is mid gesture, not idle.
+        if HELD_INPUTS.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        let uptime = origin.elapsed();
+        // Before the first observed event idle is measured from the launch, so an app that is
+        // started and then left alone is covered too.
+        let last = LAST_INPUT_MS.load(Ordering::Acquire);
+        let idle = if last == 0 {
+            uptime
+        } else {
+            Duration::from_millis(
+                u64::try_from(uptime.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(last),
+            )
+        };
+        if !should_restart(idle, uptime, idle_min, min_uptime_min) {
+            continue;
+        }
+        // The observed values are logged, so a later reader can check them against the thresholds.
+        let line = format!(
+            "[SYSTEM] event=idle_restart idle_min={} uptime_min={}",
+            idle.as_secs() / 60,
+            uptime.as_secs() / 60
+        );
+        if let Err(error) = crate::system::write_message(&app, "info", &line) {
+            eprintln!("{line} (log write failed: {error})");
+        }
+        crate::menu::restart(&app);
     }
 }
 
@@ -1389,5 +1516,132 @@ mod tests {
         assert!(!should_forward(&mut merge, &routed_move(3.0, 3.0), start));
         let later = start + std::time::Duration::from_millis(40);
         assert!(should_forward(&mut merge, &routed_move(3.0, 3.0), later));
+    }
+
+    #[test]
+    fn idle_restart_needs_the_idle_window_and_the_uptime_together() {
+        // 5 idle minutes over a 45 minute minimum uptime.
+        assert!(!should_restart(
+            Duration::from_secs(299),
+            Duration::from_secs(3600),
+            5,
+            45
+        ));
+        assert!(!should_restart(
+            Duration::from_secs(600),
+            Duration::from_secs(2699),
+            5,
+            45
+        ));
+        assert!(should_restart(
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+            5,
+            45
+        ));
+    }
+
+    #[test]
+    fn idle_restart_switches_off_at_an_idle_window_of_zero() {
+        assert!(!should_restart(
+            Duration::from_secs(86_400),
+            Duration::from_secs(86_400),
+            0,
+            0
+        ));
+        assert!(!should_restart(
+            Duration::from_secs(86_400),
+            Duration::from_secs(86_400),
+            0,
+            45
+        ));
+    }
+
+    #[test]
+    fn idle_restart_counts_both_edges_as_reached() {
+        assert!(should_restart(
+            Duration::from_secs(300),
+            Duration::from_secs(2700),
+            5,
+            45
+        ));
+        assert!(!should_restart(
+            Duration::from_millis(299_999),
+            Duration::from_secs(2700),
+            5,
+            45
+        ));
+        assert!(!should_restart(
+            Duration::from_secs(300),
+            Duration::from_millis(2_699_999),
+            5,
+            45
+        ));
+    }
+
+    #[test]
+    fn idle_restart_without_a_minimum_uptime_fires_on_the_idle_window_alone() {
+        assert!(should_restart(
+            Duration::from_secs(300),
+            Duration::ZERO,
+            5,
+            0
+        ));
+        assert!(!should_restart(
+            Duration::from_secs(299),
+            Duration::ZERO,
+            5,
+            0
+        ));
+    }
+
+    #[test]
+    fn idle_restart_minutes_fall_back_to_the_default() {
+        assert_eq!(parse_minutes(None, 5), 5);
+        assert_eq!(parse_minutes(Some("12"), 5), 12);
+        assert_eq!(parse_minutes(Some(" 7\n"), 5), 7);
+        assert_eq!(parse_minutes(Some("0"), 5), 0);
+        for invalid in ["", "-1", "5.5", "abc", "5m", "99999999999999999999"] {
+            assert_eq!(parse_minutes(Some(invalid), 5), 5, "{invalid:?} must fall back");
+        }
+        assert_eq!(parse_minutes(Some("garbage"), 45), 45);
+    }
+
+    #[test]
+    fn input_marks_move_on_every_event_and_held_keys_balance() {
+        let before = LAST_INPUT_MS.load(Ordering::Acquire);
+        note_input(&NativeInput::Move(Point { x: 1.0, y: 1.0 }));
+        assert!(LAST_INPUT_MS.load(Ordering::Acquire) >= before);
+        let held = HELD_INPUTS.load(Ordering::Acquire);
+        note_input(&NativeInput::Key {
+            key: "a".into(),
+            pressed: true,
+        });
+        note_input(&NativeInput::Button {
+            point: Point { x: 1.0, y: 1.0 },
+            button: "left",
+            pressed: true,
+        });
+        assert_eq!(HELD_INPUTS.load(Ordering::Acquire), held + 2);
+        note_input(&NativeInput::Key {
+            key: "a".into(),
+            pressed: false,
+        });
+        note_input(&NativeInput::Button {
+            point: Point { x: 1.0, y: 1.0 },
+            button: "left",
+            pressed: false,
+        });
+        assert_eq!(HELD_INPUTS.load(Ordering::Acquire), held);
+        // A release with no matching press never underflows the counter.
+        note_input(&NativeInput::Key {
+            key: "a".into(),
+            pressed: false,
+        });
+        assert_eq!(HELD_INPUTS.load(Ordering::Acquire), held.saturating_sub(1));
+        note_input(&NativeInput::Key {
+            key: "a".into(),
+            pressed: true,
+        });
     }
 }

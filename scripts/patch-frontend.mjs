@@ -361,6 +361,60 @@ export function patchMacChestStateDiagnostics(source) {
 }
 
 
+const CHEST_CLICK_HANDLER = /async function ([$\w]+)\(([$\w]+)\)\{if\([$\w]+\(\)\)\{[$\w]+\(\$\("update_force_lock_hint"\)\);return\}if\([$\w]+\.value\|\|[$\w]+\.value\)return;const [$\w]+=\2==="left"\?/g;
+
+const CHEST_CLICK_FAILURE = /catch\(([$\w]+)\)\{try\{await ([$\w]+)\}catch\{\}if\(console\.warn\("\[chest\] openChest failed",\1\),([$\w]+)\)\{([$\w]+)\("reward:claim_failed"\);const ([$\w]+)=([$\w]+)\(\1\);(\5!=null\?)([$\w]+)\(String\(\5\)\):([$\w]+)\("api_error"\)\}/g;
+
+export const MAC_CHEST_CLICK_DIAG_MARK = 'WUWA_MAC_CHEST_CLICK_DIAG';
+
+export function macChestClickDiagnosticsHelper({ side, failure, code, user, left, right, leftAnchor, rightAnchor, clicks, need }) {
+  return `/* ${MAC_CHEST_CLICK_DIAG_MARK}: read-only record of one failed chest click. A bubble can render as usable and still answer "cooling down", and that answer depends on values the UI never shows: the server code behind the toast, the userInfo deadline the clicked side carried at that instant, and the two countdowns projected from it. When the stock branch turns a failure into a toast, one entry is appended to localStorage wuwa.chestClick and the branch then continues exactly as before: the code recorded is the one the stock branch already extracted and never re-read, and the toast, the return value and the request are untouched. The record is capped at the last three entries, so it cannot grow, and no timer is installed. Every access is wrapped, so a store that throws leaves the failure path unchanged, and a field that cannot be read is recorded as null. t is the wall clock, side the clicked chest, code the server code the toast used, message the first 200 characters of the error text, raw the userInfo deadline for that side, remaining the two projected countdowns, anchor whether the local open timestamp was still unset, clicks the total click count and need the threshold its gate asked for. Delete this block and the single call site to restore stock behaviour. */
+const __wuwatappoChestClickKey="wuwa.chestClick",__wuwatappoChestClickMax=3;
+function __wuwatappoChestClickText(failure){
+try{const text=String(failure&&failure.message!=null?failure.message:failure);return text.length>200?text.slice(0,200):text}catch{return null}
+}
+function __wuwatappoChestClickRecord(side,code,failure){
+try{
+const isLeft=side==="left",list=(()=>{try{const raw=localStorage.getItem(__wuwatappoChestClickKey);const parsed=raw?JSON.parse(raw):null;return Array.isArray(parsed)?parsed:[]}catch{return[]}})();
+list.push({t:Date.now(),side:typeof side==="string"?side:null,code:code==null?null:code,message:__wuwatappoChestClickText(failure),raw:${user}.userInfo?.[isLeft?"left_treasure_chest":"right_treasure_chest"]??null,remaining:isLeft?${left}.value:${right}.value,anchor:isLeft?${leftAnchor}===null:${rightAnchor}===null,clicks:${clicks}.value,need:${need}});
+while(list.length>__wuwatappoChestClickMax)list.shift();
+localStorage.setItem(__wuwatappoChestClickKey,JSON.stringify(list))
+}catch{}
+}
+`;
+}
+
+export function patchMacChestClickDiagnostics(source) {
+  if (source.includes(MAC_CHEST_CLICK_DIAG_MARK)) throw new Error('Mac chest click diagnostics are already applied; reconcile the patch order before building.');
+  const handlers = [...source.matchAll(CHEST_CLICK_HANDLER)];
+  if (handlers.length !== 1) throw new Error(`Original treasure chest click handler changed; found ${handlers.length} of 1, reconcile the Mac chest click diagnostics before building.`);
+  const [handlerStart, , side] = handlers[0];
+  const failures = [...source.matchAll(CHEST_CLICK_FAILURE)];
+  if (failures.length !== 1) throw new Error(`Original treasure chest failure branch changed; found ${failures.length} of 1, reconcile the Mac chest click diagnostics before building.`);
+  const [failureBlock, failure, , , , code] = failures[0];
+  const gates = [...source.matchAll(CHEST_VISIBILITY_GATES)];
+  if (gates.length !== 1) throw new Error(`Original treasure chest visibility gates changed; found ${gates.length} of 1, reconcile the Mac chest click diagnostics before building.`);
+  const [, , loading, user, left, , right] = gates[0];
+  const clickGates = [...source.matchAll(CHEST_CLICK_GATES)];
+  const clickConsistent = clickGates.length === 1 && [clickGates[0][2], clickGates[0][7]].every(name => name === loading) && [clickGates[0][3], clickGates[0][8]].every(name => name === user);
+  if (!clickConsistent) throw new Error(`Original treasure chest click gates changed; found ${clickGates.length} of 1 consistent with the visibility gates, reconcile the Mac chest click diagnostics before building.`);
+  const clicks = clickGates[0][4], need = clickGates[0][5];
+  const projections = [...source.matchAll(CHEST_COUNTDOWN)];
+  const byField = new Map(projections.map(match => [match[5], { ref: match[1], anchor: match[2], store: match[4] }]));
+  const leftProjection = byField.get('left_treasure_chest'), rightProjection = byField.get('right_treasure_chest');
+  const projectionConsistent = projections.length === 2 && !!leftProjection && !!rightProjection && leftProjection.store === user && rightProjection.store === user && leftProjection.ref === left && rightProjection.ref === right && leftProjection.anchor !== rightProjection.anchor;
+  if (!projectionConsistent) throw new Error(`Original treasure chest countdown projection changed; found ${projections.length} of 2 bound to the same refs, reconcile the Mac chest click diagnostics before building.`);
+  const handlerAt = source.indexOf(handlerStart), failureAt = failures[0].index;
+  if (handlerAt < 0 || failureAt <= handlerAt) throw new Error('Original treasure chest click handler and its failure branch are out of order, reconcile the Mac chest click diagnostics before building.');
+  // The recorder goes immediately ahead of the dispatch the stock branch already performs, so the
+  // code it extracted is recorded as is and every later statement stays where it was.
+  const dispatch = failures[0][7];
+  const recorded = failureBlock.replace(dispatch, `__wuwatappoChestClickRecord(${side},${code},${failure});${dispatch}`);
+  const helper = macChestClickDiagnosticsHelper({ side, failure, code, user, left, right, leftAnchor: leftProjection.anchor, rightAnchor: rightProjection.anchor, clicks, need });
+  const patched = source.slice(0, failureAt) + recorded + source.slice(failureAt + failureBlock.length);
+  return patched.slice(0, handlerAt) + helper + patched.slice(handlerAt);
+}
+
 const CHEST_LOGIN_WATCHER = /Oe\(\(\)=>([$\w]+)\.isLoggedIn,([$\w]+)=>{([$\w]+)\.value=!1,[$\w]+\+\+,[$\w]+=null,[$\w]+=null,[$\w]+=null,[$\w]+\(\),\2&&([$\w]+)\(\)},\{flush:"sync"\}\)/g;
 
 export const MAC_CHEST_READY_FIX_MARK = 'WUWA_MAC_CHEST_READY_FIX';

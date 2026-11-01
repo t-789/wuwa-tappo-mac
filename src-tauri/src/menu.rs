@@ -448,7 +448,7 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
                     app.exit(0);
                     return;
                 }
-                "restart" => app.restart(),
+                "restart" => restart(app),
                 _ => {}
             }
         }
@@ -464,6 +464,12 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+/// The one restart path. The menu item and the idle self-heal both come through here, so a
+/// restart is always the same operation no matter who asked for it.
+pub fn restart(app: &AppHandle) -> ! {
+    app.restart()
 }
 
 pub fn sync(app: &AppHandle, args: &Value) -> Result<Value, String> {

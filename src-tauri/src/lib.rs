@@ -316,6 +316,7 @@ pub fn run() {
             }
             menu::setup(&handle)?;
             app.manage(system::start_network_monitor(handle.clone())?);
+            input::start_idle_watch(handle.clone());
             tauri::WebviewWindowBuilder::new(
                 app,
                 "bootstrap",
